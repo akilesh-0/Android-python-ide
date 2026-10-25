@@ -13,7 +13,7 @@ version = 0.1.0
 
 # Core Kivy app dependencies.
 # Pygame requires a compatible Android build recipe.
-requirements = python3,kivy
+requirements = python3,kivy,pygments
 
 orientation = portrait
 fullscreen = 0
