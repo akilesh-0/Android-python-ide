@@ -274,9 +274,31 @@ class ConsoleStream:
         return True
 
 
-class SmartCodeInput(CodeInput):
-    """Python editor with syntax highlighting and smart newline indentation."""
+HOLD_SECONDS = 0.4  # press-and-hold time that starts normal text selection
 
+
+class SmartCodeInput(CodeInput):
+    """Python editor with smart indentation and its own touch scrolling.
+
+    A quick tap places the cursor and opens the keyboard. Dragging scrolls in
+    both directions (with a little momentum) without touching the keyboard.
+    Press-and-hold falls back to normal TextInput selection.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.ide_rows = 1
+        self.ide_cols = 0
+        self.ide_vel = [0, 0]
+        self.ide_fling = None
+        label = CoreLabel(text="0", font_size=self.font_size,
+                          font_name=self.font_name)
+        label.refresh()
+        self.ide_char_w = label.texture.width
+        self.bind(text=self._ide_text_stats)
+        self._ide_text_stats(self, self.text)
+
+    # -- smart indentation ---------------------------------------------
     def insert_text(self, substring, from_undo=False):
         if substring == "\t":
             substring = INDENT
@@ -303,6 +325,123 @@ class SmartCodeInput(CodeInput):
 
         super().insert_text(substring, from_undo=from_undo)
 
+    # -- scrolling -----------------------------------------------------
+    def _ide_text_stats(self, instance, value):
+        self.ide_rows = value.count("\n") + 1
+        self.ide_cols = max(map(len, value.split("\n")))
+
+    def _max_scroll_y(self):
+        dy = self.line_height + self.line_spacing
+        content = self.ide_rows * dy + self.padding[1] + self.padding[3]
+        return max(0, content - self.height + self.height * 0.25)
+
+    def _max_scroll_x(self):
+        content = (self.ide_cols * self.ide_char_w
+                   + self.padding[0] + self.padding[2] + dp(24))
+        return max(0, content - self.width)
+
+    def _scroll_by(self, dx, dy):
+        """Scroll by a finger movement; returns True if anything moved."""
+        new_x = min(max(self.scroll_x - dx, 0), self._max_scroll_x())
+        new_y = min(max(self.scroll_y + dy, 0), self._max_scroll_y())
+        moved = new_x != self.scroll_x or new_y != self.scroll_y
+        self.scroll_x = new_x
+        self.scroll_y = new_y
+        return moved
+
+    def _start_fling(self):
+        if abs(self.ide_vel[0]) + abs(self.ide_vel[1]) < dp(3):
+            return
+        self._stop_fling()
+        self.ide_fling = Clock.schedule_interval(self._fling_step, 1 / 60.0)
+
+    def _stop_fling(self):
+        if self.ide_fling is not None:
+            self.ide_fling.cancel()
+            self.ide_fling = None
+
+    def _fling_step(self, dt):
+        vx, vy = self.ide_vel
+        if (abs(vx) < 0.5 and abs(vy) < 0.5) or not self._scroll_by(vx, vy):
+            self._stop_fling()
+            return
+        self.ide_vel = [vx * 0.94, vy * 0.94]
+
+    # -- touch handling ------------------------------------------------
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return super().on_touch_down(touch)
+        if str(getattr(touch, "button", "left")).startswith("scroll"):
+            return super().on_touch_down(touch)  # desktop mouse wheel
+
+        self._stop_fling()
+        touch.grab(self)
+        touch.ud["ide_mode"] = "pending"
+        touch.ud["ide_start"] = touch.pos
+        touch.ud["ide_axis"] = None
+        touch.ud["ide_hold"] = Clock.schedule_once(
+            partial(self._hold_touch, touch), HOLD_SECONDS)
+        return True
+
+    def _hold_touch(self, touch, dt):
+        # Finger stayed down without moving: hand over to normal TextInput
+        # behaviour (selection handles, copy/paste bubble).
+        if touch.ud.get("ide_mode") == "pending":
+            touch.ud["ide_mode"] = "forwarded"
+            CodeInput.on_touch_down(self, touch)
+
+    def on_touch_move(self, touch):
+        mode = touch.ud.get("ide_mode")
+        if mode is None or touch.grab_current is not self:
+            return super().on_touch_move(touch)
+
+        if mode == "forwarded":
+            return super().on_touch_move(touch)
+
+        sx, sy = touch.ud["ide_start"]
+        if mode == "pending":
+            if abs(touch.x - sx) < dp(10) and abs(touch.y - sy) < dp(10):
+                return True
+            hold = touch.ud.get("ide_hold")
+            if hold is not None:
+                hold.cancel()
+            ax, ay = abs(touch.x - sx), abs(touch.y - sy)
+            touch.ud["ide_axis"] = "x" if ax > 1.6 * ay else (
+                "y" if ay > 1.6 * ax else None)
+            touch.ud["ide_mode"] = "scroll"
+            dx, dy = touch.x - sx, touch.y - sy  # catch up on the slop distance
+        else:
+            dx, dy = touch.dx, touch.dy
+
+        axis = touch.ud["ide_axis"]
+        if axis == "x":
+            dy = 0
+        elif axis == "y":
+            dx = 0
+        self._scroll_by(dx, dy)
+        self.ide_vel = [dx, dy]
+        return True
+
+    def on_touch_up(self, touch):
+        mode = touch.ud.get("ide_mode")
+        if mode is None or touch.grab_current is not self:
+            return super().on_touch_up(touch)
+
+        hold = touch.ud.get("ide_hold")
+        if hold is not None:
+            hold.cancel()
+
+        if mode == "pending":
+            # A quick tap: let TextInput place the cursor and open the keyboard.
+            CodeInput.on_touch_down(self, touch)
+            CodeInput.on_touch_up(self, touch)
+        elif mode == "forwarded":
+            CodeInput.on_touch_up(self, touch)
+        elif mode == "scroll":
+            self._start_fling()
+        touch.ungrab(self)
+        return True
+
 
 class LineNumberGutter(StencilView):
     """Line numbers drawn next to a SmartCodeInput.
@@ -312,17 +451,23 @@ class LineNumberGutter(StencilView):
     subtle highlight behind the current line in the editor.
     """
 
-    def __init__(self, editor, **kwargs):
-        super().__init__(size_hint_x=None, width=dp(44), **kwargs)
+    def __init__(self, editor, backdrop, **kwargs):
+        super().__init__(size_hint_x=None, width=dp(36), **kwargs)
         self.editor = editor
         self._textures = {}
         self._digits = 2
         self._total = editor.text.count("\n") + 1
         self._digit_width = self._render("0").width
 
-        with editor.canvas.before:
+        self.width = self._digit_width * self._digits + dp(12)
+
+        # The highlight is drawn on the backdrop, behind the transparent
+        # editor. (Drawing it inside the editor's own canvas would override
+        # the colour TextInput uses for its text and make the text faint.)
+        with backdrop.canvas.before:
             self._hl_color = Color(1, 1, 1, 0.05)
             self._hl_rect = Rectangle(pos=(0, 0), size=(0, 0))
+            Color(1, 1, 1, 1)
 
         self._trigger = Clock.create_trigger(self.redraw, 0)
         editor.bind(
@@ -366,7 +511,7 @@ class LineNumberGutter(StencilView):
         digits = max(2, len(str(total)))
         if digits != self._digits:
             self._digits = digits
-            self.width = self._digit_width * digits + dp(22)
+            self.width = self._digit_width * digits + dp(12)
 
         pad_top = ed.padding[1]
         top0 = ed.top - pad_top + ed.scroll_y  # top edge of the first line
@@ -396,7 +541,7 @@ class LineNumberGutter(StencilView):
                 Color(*(C_TEXT if number == current else C_MUTED))
                 Rectangle(
                     texture=texture,
-                    pos=(self.right - dp(11) - texture.width,
+                    pos=(self.right - dp(6) - texture.width,
                          row_bottom + (dy - texture.height) / 2),
                     size=texture.size,
                 )
@@ -573,19 +718,20 @@ class PythonIDE(App):
             unfocus_on_touch=False,  # keep the keyboard up while using the symbol bar
             font_size=sp(15),
             font_name=MONO_FONT,
+            foreground_color=C_TEXT,          # default colour for unstyled tokens
+            background_color=(0, 0, 0, 0),    # transparent: the area paints C_BG
             background_normal="",
             background_active="",
             cursor_color=C_ACCENT,
             selection_color=(0.74, 0.58, 0.98, 0.35),
-            padding=[dp(8), dp(8), dp(8), dp(8)],
+            padding=[dp(6), dp(8), dp(8), dp(8)],
             lexer=PythonLexer(),
             style_name=pick_style(),
             tab_width=4,
             **extra,
         )
-        self.editor.background_color = C_BG
 
-        self.gutter = LineNumberGutter(self.editor)
+        self.gutter = LineNumberGutter(self.editor, area)
         area.add_widget(self.gutter)
         area.add_widget(self.editor)
         return area
