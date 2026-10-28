@@ -347,7 +347,20 @@ class SmartCodeInput(CodeInput):
         moved = new_x != self.scroll_x or new_y != self.scroll_y
         self.scroll_x = new_x
         self.scroll_y = new_y
+        if moved:
+            self._redraw_text()
         return moved
+
+    def _redraw_text(self):
+        # TextInput doesn't redraw its text when scroll_x/scroll_y are set from
+        # outside, so the numbers moved but the text stayed. Ask it to redraw.
+        try:
+            self._trigger_update_graphics()
+        except Exception:
+            try:
+                self._update_graphics()
+            except Exception:
+                pass
 
     def _start_fling(self):
         if abs(self.ide_vel[0]) + abs(self.ide_vel[1]) < dp(3):
@@ -574,7 +587,7 @@ class PythonIDE(App):
     def build(self):
         self.title = "Python IDE"
         Window.clearcolor = C_BG
-        Window.softinput_mode = "below_target"
+        Window.softinput_mode = "resize"  # layout shrinks above the keyboard
 
         # Workspace: app-private folder, so no storage permissions are needed.
         self.workspace = os.path.join(self.user_data_dir, "workspace")
@@ -611,6 +624,7 @@ class PythonIDE(App):
         sys.stderr = ConsoleStream(self, self._orig_stderr)
 
         root = BoxLayout(orientation="vertical")
+        self.root_layout = root
         paint(root, C_BG)
 
         root.add_widget(self.build_app_bar())
@@ -625,6 +639,7 @@ class PythonIDE(App):
         Window.bind(on_keyboard=self.on_keyboard, on_key_down=self.on_key_down)
 
         self.editor.bind(text=self.on_editor_text, cursor=self.update_cursor)
+        self.editor.bind(focus=self.on_editor_focus)
         self.editor.bind(text=self.update_suggestions,
                          cursor=self.update_suggestions)
 
@@ -849,6 +864,9 @@ class PythonIDE(App):
         if self.popup is not None:
             self.close_popup()
             return True
+        if self.editor.focus:
+            self.editor.focus = False
+            return True
         if self.dirty:
             self.guard_unsaved(self.exit_app)
             return True
@@ -869,6 +887,17 @@ class PythonIDE(App):
         else:
             return False
         return True
+
+    def on_editor_focus(self, editor, focused):
+        # While typing, give the editor all the room above the keyboard.
+        self.set_console_visible(not focused)
+
+    def set_console_visible(self, visible):
+        parent = self.console.parent
+        if visible and parent is None:
+            self.root_layout.add_widget(self.console, index=1)  # above status bar
+        elif not visible and parent is not None:
+            parent.remove_widget(self.console)
 
     def exit_app(self):
         self.dirty = False
