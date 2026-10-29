@@ -30,7 +30,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.splitter import Splitter
 from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
-from kivy.utils import escape_markup, get_color_from_hex
+from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
 
@@ -107,6 +107,32 @@ def raise_in_thread(thread, exc_type):
     ctypes.pythonapi.PyThreadState_SetAsyncExc(
         ctypes.c_ulong(thread.ident), ctypes.py_object(exc_type)
     )
+
+
+_JNI = {}
+
+
+def read_ime_height():
+    """Soft-keyboard height in pixels, read from Android WindowInsets (API 30+).
+
+    Returns 0 when the keyboard is hidden and None when it can't be measured
+    (not Android, old Android, or the lookup failed).
+    """
+    if platform != "android" or _JNI.get("dead"):
+        return None
+    try:
+        if "decor" not in _JNI:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            _JNI["decor"] = activity.getWindow().getDecorView()
+            _JNI["type"] = autoclass("android.view.WindowInsets$Type")
+        insets = _JNI["decor"].getRootWindowInsets()
+        if insets is None:
+            return 0
+        return int(insets.getInsets(_JNI["type"].ime()).bottom)
+    except Exception:
+        _JNI["dead"] = True
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -333,7 +359,8 @@ class SmartCodeInput(CodeInput):
     def _max_scroll_y(self):
         dy = self.line_height + self.line_spacing
         content = self.ide_rows * dy + self.padding[1] + self.padding[3]
-        return max(0, content - self.height + self.height * 0.25)
+        # Allow scrolling until only ~2 lines remain visible at the top.
+        return max(0, content - dy * 2)
 
     def _max_scroll_x(self):
         content = (self.ide_cols * self.ide_char_w
@@ -587,7 +614,7 @@ class PythonIDE(App):
     def build(self):
         self.title = "Python IDE"
         Window.clearcolor = C_BG
-        Window.softinput_mode = "resize"  # layout shrinks above the keyboard
+        Window.softinput_mode = ""  # we lift the layout above the keyboard ourselves
 
         # Workspace: app-private folder, so no storage permissions are needed.
         self.workspace = os.path.join(self.user_data_dir, "workspace")
@@ -616,6 +643,9 @@ class PythonIDE(App):
         self.state_text = "Ready"
         self._last_options = ()
         self._bar_current = None
+        self.kb_height = 0
+        self._full_height = Window.height
+        self._ime_works = False
 
         # Route print()/stderr from the running program to the console.
         self._orig_stdout = sys.stdout
@@ -637,6 +667,7 @@ class PythonIDE(App):
         root.add_widget(self.build_status_bar())
 
         Window.bind(on_keyboard=self.on_keyboard, on_key_down=self.on_key_down)
+        Clock.schedule_interval(self.poll_keyboard, 0.2)
 
         self.editor.bind(text=self.on_editor_text, cursor=self.update_cursor)
         self.editor.bind(focus=self.on_editor_focus)
@@ -889,8 +920,35 @@ class PythonIDE(App):
         return True
 
     def on_editor_focus(self, editor, focused):
-        # While typing, give the editor all the room above the keyboard.
-        self.set_console_visible(not focused)
+        self.refresh_console_visibility()
+
+    def refresh_console_visibility(self):
+        # While the keyboard is up for the editor, give it all the room.
+        typing = self.editor.focus and self.kb_height > 0
+        self.set_console_visible(not typing)
+
+    def measure_keyboard(self):
+        self._full_height = max(self._full_height, Window.height)
+        shrunk = self._full_height - Window.height  # if Android resized the window
+        raw = read_ime_height()
+        height = Window.keyboard_height or 0
+        if raw is not None:
+            height = max(height, raw)
+            if raw > 0:
+                self._ime_works = True
+        if not height and not self._ime_works:
+            # Couldn't measure: assume a typical keyboard while a field has focus.
+            if self.editor.focus or self.input_field.focus:
+                height = int(Window.height * 0.36)
+        return max(0, int(height - shrunk))
+
+    def poll_keyboard(self, dt):
+        height = self.measure_keyboard()
+        if abs(height - self.kb_height) > 2:
+            self.kb_height = height
+            # Lift the whole layout so nothing sits behind the keyboard.
+            self.root_layout.padding = [0, 0, 0, height]
+            self.refresh_console_visibility()
 
     def set_console_visible(self, visible):
         parent = self.console.parent
@@ -1057,13 +1115,14 @@ class PythonIDE(App):
     # Popups and dialogs
     # ------------------------------------------------------------------
     def open_popup(self, title, content, size_hint=(0.92, None),
-                   height=dp(220)):
+                   height=dp(220), pos_hint=None):
         self.close_popup()
         popup = Popup(
             title=title,
             content=content,
             size_hint=size_hint,
             height=height,
+            pos_hint=pos_hint or {"center_x": 0.5, "center_y": 0.5},
             background="",
             background_color=C_PANEL,
             overlay_color=(0, 0, 0, 0.65),
@@ -1147,7 +1206,8 @@ class PythonIDE(App):
         content.add_widget(error)
         content.add_widget(row)
 
-        popup = self.open_popup("Save as", content, height=dp(280))
+        popup = self.open_popup("Save as", content, height=dp(280),
+                                pos_hint={"center_x": 0.5, "top": 0.93})
 
         def do_save(*args):
             try:
@@ -1324,6 +1384,7 @@ class PythonIDE(App):
     def show_input_panel(self, dt):
         if self.worker is None:
             return
+        self.set_console_visible(True)
         self.input_panel.height = dp(46)
         self.input_panel.opacity = 1
         self.input_panel.disabled = False
