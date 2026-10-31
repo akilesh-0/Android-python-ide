@@ -231,6 +231,13 @@ def _open_game_view(surface):
             "NovaGame display requires a running Kivy Android app."
         ) from exc
 
+    # A previous game session may have left a QUIT event in the queue
+    # (for example, when Android Back dismissed the game view just as the
+    # user's loop was finishing). Do not let that old event terminate the
+    # next game session immediately.
+    with _event_lock:
+        _event_queue.clear()
+
     _ui_ready.clear()
     _game_closed = False
     creation_error = []
