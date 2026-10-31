@@ -31,6 +31,8 @@ android.ndk_api = 24
 android.archs = armeabi-v7a
 
 # Application permissions
+# Device files are opened/saved with Android's Storage Access Framework
+# (system document picker), so broad shared-storage permissions are not needed.
 android.permissions = INTERNET
 
 # Build configuration
