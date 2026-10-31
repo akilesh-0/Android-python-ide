@@ -30,7 +30,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.splitter import Splitter
 from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
-from kivy.utils import escape_markup, get_color_from_hex
+from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
 
@@ -107,6 +107,32 @@ def raise_in_thread(thread, exc_type):
     ctypes.pythonapi.PyThreadState_SetAsyncExc(
         ctypes.c_ulong(thread.ident), ctypes.py_object(exc_type)
     )
+
+
+_JNI = {}
+
+
+def read_ime_height():
+    """Soft-keyboard height in pixels, read from Android WindowInsets (API 30+).
+
+    Returns 0 when the keyboard is hidden and None when it can't be measured
+    (not Android, old Android, or the lookup failed).
+    """
+    if platform != "android" or _JNI.get("dead"):
+        return None
+    try:
+        if "decor" not in _JNI:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            _JNI["decor"] = activity.getWindow().getDecorView()
+            _JNI["type"] = autoclass("android.view.WindowInsets$Type")
+        insets = _JNI["decor"].getRootWindowInsets()
+        if insets is None:
+            return 0
+        return int(insets.getInsets(_JNI["type"].ime()).bottom)
+    except Exception:
+        _JNI["dead"] = True
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -274,6 +300,81 @@ class ConsoleStream:
         return True
 
 
+class FdCapture:
+    """Capture C-level writes to stdout/stderr while a program runs.
+
+    Python's print() and tracebacks are already routed by ConsoleStream; this
+    also catches output written by native code (SDL, pygame internals).
+    """
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.saved = {}
+        self.read_fd = None
+        self.thread = None
+
+    def start(self):
+        if self.thread is not None:
+            return
+        try:
+            read_fd, write_fd = os.pipe()
+        except OSError:
+            return
+        for fd in (1, 2):
+            try:
+                self.saved[fd] = os.dup(fd)
+                os.dup2(write_fd, fd)
+            except OSError:
+                self.saved.pop(fd, None)
+        os.close(write_fd)
+        if not self.saved:
+            os.close(read_fd)
+            return
+        self.read_fd = read_fd
+        self.thread = threading.Thread(target=self._pump, daemon=True)
+        self.thread.start()
+
+    def _pump(self):
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            try:
+                data = os.read(self.read_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            text = decoder.decode(data)
+            if text:
+                self.sink(text)
+
+    def stop(self):
+        if self.thread is None:
+            return
+        try:
+            ctypes.CDLL(None).fflush(None)  # flush C stdio buffers
+        except Exception:
+            pass
+        for fd, saved in self.saved.items():
+            try:
+                os.dup2(saved, fd)
+            except OSError:
+                pass
+            try:
+                os.close(saved)
+            except OSError:
+                pass
+        self.saved = {}
+        self.thread.join(1.0)
+        if not self.thread.is_alive():
+            try:
+                os.close(self.read_fd)
+            except OSError:
+                pass
+        self.thread = None
+        self.read_fd = None
+
+
 HOLD_SECONDS = 0.4  # press-and-hold time that starts normal text selection
 
 
@@ -299,9 +400,33 @@ class SmartCodeInput(CodeInput):
         self._ide_text_stats(self, self.text)
 
     # -- smart indentation ---------------------------------------------
+    def paste(self):
+        """Paste straight from the Android clipboard.
+
+        Pasting through the keyboard's own clipboard panel goes via SDL's text
+        input, which can mangle multi-line text; this path doesn't.
+        """
+        try:
+            from kivy.core.clipboard import Clipboard
+            data = Clipboard.paste()
+        except Exception:
+            data = ""
+        if not data:
+            return
+        try:
+            self._hide_cut_copy_paste()
+        except Exception:
+            pass
+        self.delete_selection()
+        self.insert_text(data)
+
     def insert_text(self, substring, from_undo=False):
-        if substring == "\t":
-            substring = INDENT
+        if substring:
+            # Normalise line endings, tabs and stray NUL characters.
+            substring = (substring.replace("\r\n", "\n").replace("\r", "\n")
+                         .replace("\t", INDENT).replace("\x00", ""))
+        if not substring:
+            return
 
         # Smart indentation only for a single Enter keypress, not for paste.
         if substring == "\n":
@@ -333,7 +458,8 @@ class SmartCodeInput(CodeInput):
     def _max_scroll_y(self):
         dy = self.line_height + self.line_spacing
         content = self.ide_rows * dy + self.padding[1] + self.padding[3]
-        return max(0, content - self.height + self.height * 0.25)
+        # Allow scrolling until only ~2 lines remain visible at the top.
+        return max(0, content - dy * 2)
 
     def _max_scroll_x(self):
         content = (self.ide_cols * self.ide_char_w
@@ -569,7 +695,7 @@ SAMPLE_CODE = (
     'print("Your Python IDE is working!")\n'
 )
 
-SYMBOLS = ["TAB", "(", ")", "[", "]", "{", "}", ":", '"', "'", "=", "#",
+SYMBOLS = ["TAB", "PASTE", "(", ")", "[", "]", "{", "}", ":", '"', "'", "=", "#",
            "_", ".", ",", "+", "-", "*", "/", "<", ">"]
 PAIRS = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
 
@@ -587,7 +713,7 @@ class PythonIDE(App):
     def build(self):
         self.title = "Python IDE"
         Window.clearcolor = C_BG
-        Window.softinput_mode = "resize"  # layout shrinks above the keyboard
+        Window.softinput_mode = ""  # we lift the layout above the keyboard ourselves
 
         # Workspace: app-private folder, so no storage permissions are needed.
         self.workspace = os.path.join(self.user_data_dir, "workspace")
@@ -616,6 +742,10 @@ class PythonIDE(App):
         self.state_text = "Ready"
         self._last_options = ()
         self._bar_current = None
+        self.fd_capture = None
+        self.kb_height = 0
+        self._full_height = Window.height
+        self._ime_works = False
 
         # Route print()/stderr from the running program to the console.
         self._orig_stdout = sys.stdout
@@ -637,6 +767,7 @@ class PythonIDE(App):
         root.add_widget(self.build_status_bar())
 
         Window.bind(on_keyboard=self.on_keyboard, on_key_down=self.on_key_down)
+        Clock.schedule_interval(self.poll_keyboard, 0.2)
 
         self.editor.bind(text=self.on_editor_text, cursor=self.update_cursor)
         self.editor.bind(focus=self.on_editor_focus)
@@ -706,7 +837,7 @@ class PythonIDE(App):
             button = FlatButton(
                 text=symbol,
                 size_hint=(None, 1),
-                width=dp(52 if symbol == "TAB" else 38),
+                width=dp({"TAB": 52, "PASTE": 64}.get(symbol, 38)),
                 font_size=sp(13),
             )
             button.bind(on_release=partial(self.insert_symbol, symbol))
@@ -849,10 +980,12 @@ class PythonIDE(App):
         return True
 
     def on_resume(self):
-        pass
+        Clock.schedule_once(self.refresh_display, 0.2)
 
     def on_stop(self):
+        self.close_game_screen()
         self.save_session()
+        self.stop_capture()
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         raise_in_thread(self.worker, StopRun)
@@ -861,6 +994,10 @@ class PythonIDE(App):
                     modifier=None):
         if key != 27:  # Android back button / Esc
             return False
+        game = sys.modules.get("pygame_host")
+        if game is not None and game.is_open():
+            game.request_close()
+            return True
         if self.popup is not None:
             self.close_popup()
             return True
@@ -889,8 +1026,35 @@ class PythonIDE(App):
         return True
 
     def on_editor_focus(self, editor, focused):
-        # While typing, give the editor all the room above the keyboard.
-        self.set_console_visible(not focused)
+        self.refresh_console_visibility()
+
+    def refresh_console_visibility(self):
+        # While the keyboard is up for the editor, give it all the room.
+        typing = self.editor.focus and self.kb_height > 0
+        self.set_console_visible(not typing)
+
+    def measure_keyboard(self):
+        self._full_height = max(self._full_height, Window.height)
+        shrunk = self._full_height - Window.height  # if Android resized the window
+        raw = read_ime_height()
+        height = Window.keyboard_height or 0
+        if raw is not None:
+            height = max(height, raw)
+            if raw > 0:
+                self._ime_works = True
+        if not height and not self._ime_works:
+            # Couldn't measure: assume a typical keyboard while a field has focus.
+            if self.editor.focus or self.input_field.focus:
+                height = int(Window.height * 0.36)
+        return max(0, int(height - shrunk))
+
+    def poll_keyboard(self, dt):
+        height = self.measure_keyboard()
+        if abs(height - self.kb_height) > 2:
+            self.kb_height = height
+            # Lift the whole layout so nothing sits behind the keyboard.
+            self.root_layout.padding = [0, 0, 0, height]
+            self.refresh_console_visibility()
 
     def set_console_visible(self, visible):
         parent = self.console.parent
@@ -1057,13 +1221,14 @@ class PythonIDE(App):
     # Popups and dialogs
     # ------------------------------------------------------------------
     def open_popup(self, title, content, size_hint=(0.92, None),
-                   height=dp(220)):
+                   height=dp(220), pos_hint=None):
         self.close_popup()
         popup = Popup(
             title=title,
             content=content,
             size_hint=size_hint,
             height=height,
+            pos_hint=pos_hint or {"center_x": 0.5, "center_y": 0.5},
             background="",
             background_color=C_PANEL,
             overlay_color=(0, 0, 0, 0.65),
@@ -1147,7 +1312,8 @@ class PythonIDE(App):
         content.add_widget(error)
         content.add_widget(row)
 
-        popup = self.open_popup("Save as", content, height=dp(280))
+        popup = self.open_popup("Save as", content, height=dp(280),
+                                pos_hint={"center_x": 0.5, "top": 0.93})
 
         def do_save(*args):
             try:
@@ -1324,6 +1490,7 @@ class PythonIDE(App):
     def show_input_panel(self, dt):
         if self.worker is None:
             return
+        self.set_console_visible(True)
         self.input_panel.height = dp(46)
         self.input_panel.opacity = 1
         self.input_panel.disabled = False
@@ -1361,6 +1528,8 @@ class PythonIDE(App):
         editor = self.editor
         if symbol == "TAB":
             editor.insert_text(INDENT)
+        elif symbol == "PASTE":
+            editor.paste()
         elif symbol in PAIRS:
             editor.insert_text(symbol + PAIRS[symbol])
             editor.do_cursor_movement("cursor_left")
@@ -1436,6 +1605,8 @@ class PythonIDE(App):
         self.editor.focus = False  # hide the keyboard so the console is visible
         self.clear_output()
         self.purge_workspace_modules()
+        if "pygame" in code:
+            self.setup_pygame()
 
         # Remove stale answers / stop signals from an earlier run.
         while True:
@@ -1452,11 +1623,27 @@ class PythonIDE(App):
         self.stop_button.disabled = False
         self.set_state("Running...")
 
+        self.fd_capture = FdCapture(self.append_output)
+        self.fd_capture.start()
+
         thread = threading.Thread(
             target=self.execute_code, args=(code, name, file_path), daemon=True
         )
         self.worker = thread
         thread.start()
+
+    def setup_pygame(self):
+        """Plug in the pygame-compatible layer (pygame/ + pygame_host.py)."""
+        try:
+            import pygame_host
+            pygame_host.setup(self)
+            pygame_host.begin_run()
+        except Exception as exc:
+            self.append_output(
+                "[pygame layer] could not start: %s: %s\n"
+                "Make sure the pygame/ folder, pygame_host.py and "
+                "pygame_render.py are next to main.py.\n\n"
+                % (type(exc).__name__, exc))
 
     def purge_workspace_modules(self):
         """Forget workspace modules so edited helper files are re-imported."""
@@ -1537,7 +1724,29 @@ class PythonIDE(App):
         self.worker = None
         self.reset_ui()
 
+    def stop_capture(self):
+        if self.fd_capture is not None:
+            self.fd_capture.stop()
+            self.fd_capture = None
+
+    def refresh_display(self, dt=None):
+        # After a full-screen pygame window closes, make Kivy repaint itself.
+        try:
+            Window.update_viewport()
+            Window.canvas.ask_update()
+        except Exception:
+            pass
+
+    def close_game_screen(self):
+        game = sys.modules.get("pygame_host")
+        if game is not None:
+            game.end_run()
+
     def reset_ui(self):
+        self.close_game_screen()
+        self.stop_capture()
+        Clock.schedule_once(self.refresh_display, 0.1)
+        Clock.schedule_once(self.refresh_display, 0.6)
         self.run_button.disabled = False
         self.stop_button.disabled = True
         self.hide_input_panel()
