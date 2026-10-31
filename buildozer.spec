@@ -1,8 +1,8 @@
 
 [app]
 
-title = Android Python IDE
-package.name = androidpythonide
+title = pugame test
+package.name = pygametest
 package.domain = org.akilesh
 
 source.dir = .
