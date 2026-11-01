@@ -11,6 +11,7 @@ from collections import OrderedDict
 
 from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel
+from kivy.graphics.texture import Texture
 from kivy.graphics import (Color, Ellipse, Line, Mesh, PopMatrix, PushMatrix,
                            Rectangle, RoundedRectangle, Rotate, Scale,
                            Translate, Triangle)
@@ -81,6 +82,7 @@ class Renderer:
         self._images = {}
         self._bases = {}
         self._texts = OrderedDict()
+        self._pixel_textures = OrderedDict()
         self._color = None
         self.last_error = None
 
@@ -114,6 +116,13 @@ class Renderer:
             if texture is not None:
                 self._set_color((255, 255, 255, 255), alpha)
                 Rectangle(texture=texture, pos=(x, y), size=(w, h))
+            return
+        if kind == "pixels":
+            _, raw, pw, ph = cmd
+            texture = self._pixel_texture(raw, pw, ph, colorkey)
+            if texture is not None:
+                self._set_color((255, 255, 255, 255), alpha)
+                Rectangle(texture=texture, pos=(0, 0), size=(pw, ph))
             return
 
         color = cmd[1]
@@ -224,6 +233,33 @@ class Renderer:
             PopMatrix()
 
     # -- textures (flipped once: the frame is drawn with a flipped y axis) -----
+    def _pixel_texture(self, raw, width, height, colorkey=None):
+        key = (int(width), int(height))
+        color_key = tuple(colorkey[:3]) if colorkey is not None else None
+        cache_key = (id(raw), key[0], key[1], color_key)
+        entry = self._pixel_textures.get(cache_key)
+        if entry is None:
+            upload = raw
+            if color_key is not None:
+                # Apply Pygame's colorkey to the pixel snapshot as transparency.
+                upload = bytearray(raw)
+                for offset in range(0, len(upload), 4):
+                    if tuple(upload[offset:offset+3]) == color_key:
+                        upload[offset+3] = 0
+                upload = bytes(upload)
+            texture = Texture.create(size=key, colorfmt="rgba", bufferfmt="ubyte")
+            texture.blit_buffer(upload, colorfmt="rgba", bufferfmt="ubyte")
+            texture.flip_vertical()
+            self._pixel_textures[cache_key] = (texture, raw, upload)
+        else:
+            texture, _source_keepalive, _upload_keepalive = entry
+            self._pixel_textures.move_to_end(cache_key)
+        # Keep a small LRU: old canvas instructions retain their own texture
+        # references until Kivy has rendered the frame.
+        if len(self._pixel_textures) > 2:
+            self._pixel_textures.popitem(last=False)
+        return texture
+
     def _image_texture(self, path, region):
         key = (path, region)
         texture = self._images.get(key)

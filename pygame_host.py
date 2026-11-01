@@ -31,6 +31,48 @@ from pygame.event import Event
 _host = None
 
 
+class _AudioPlayback:
+    """State wrapper around the Kivy Sound instance (owned by the UI thread)."""
+
+    def __init__(self, sound):
+        self.sound = sound
+        self.busy = False
+        self.paused = False
+        self.position = 0.0
+        self.volume = 1.0
+        self.remaining_loops = 0
+        self.loop_forever = False
+        self.manual_stop = False
+        self.on_complete = None
+        self._maxtime_event = None
+        self._fade_event = None
+        self._volume_event = None
+        try:
+            sound.bind(on_stop=self._on_stop)
+        except Exception:
+            pass
+
+    def _on_stop(self, *args):
+        if self.manual_stop or not self.busy:
+            return
+        if self.remaining_loops > 0:
+            self.remaining_loops -= 1
+            Clock.schedule_once(self._restart, 0)
+        else:
+            self.busy = False
+            callback, self.on_complete = self.on_complete, None
+            if callback is not None:
+                try: callback()
+                except Exception: pass
+
+    def _restart(self, dt):
+        if self.busy and not self.manual_stop:
+            try:
+                self.sound.play()
+            except Exception:
+                self.busy = False
+
+
 # ----------------------------------------------------------------------
 # Public API used by main.py
 # ----------------------------------------------------------------------
@@ -113,6 +155,202 @@ class KivyHost:
         self._pad_down = set()
         self._frames = 0
         self._fps_start = time.perf_counter()
+        self._main_thread_id = threading.get_ident()
+        self._audio_handles = set()
+
+    def _call_on_main(self, callback, timeout=10.0):
+        """Run Kivy/audio-provider work on the UI thread and return its value."""
+        if threading.get_ident() == self._main_thread_id:
+            return callback()
+        done = threading.Event()
+        result = {}
+
+        def invoke(dt):
+            try:
+                result["value"] = callback()
+            except BaseException as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        Clock.schedule_once(invoke, 0)
+        if not done.wait(timeout):
+            raise RuntimeError("Kivy UI thread did not respond to an audio request")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def _audio_stop_main(self, handle):
+        if handle is None:
+            return
+        if handle._maxtime_event is not None:
+            Clock.unschedule(handle._maxtime_event)
+            handle._maxtime_event = None
+        if handle._fade_event is not None:
+            Clock.unschedule(handle._fade_event)
+            handle._fade_event = None
+        if handle._volume_event is not None:
+            Clock.unschedule(handle._volume_event)
+            handle._volume_event = None
+        handle.manual_stop = True
+        handle.busy = False
+        handle.paused = False
+        handle.position = 0.0
+        try:
+            handle.sound.stop()
+        finally:
+            handle.manual_stop = False
+
+    # -- audio bridge: called by pygame.mixer from the game worker ------------
+    def audio_load(self, path):
+        def load_main():
+            from kivy.core.audio import SoundLoader
+            sound = SoundLoader.load(path)
+            if sound is None:
+                return None
+            handle = _AudioPlayback(sound)
+            self._audio_handles.add(handle)
+            return handle
+        return self._call_on_main(load_main)
+
+    def audio_play(self, handle, loops=0, maxtime=0, fade_ms=0, start=0.0):
+        def play_main():
+            self._audio_stop_main(handle)
+            handle.remaining_loops = max(0, int(loops))
+            handle.loop_forever = int(loops) < 0
+            try:
+                handle.sound.loop = handle.loop_forever
+            except Exception:
+                pass
+            target_volume = handle.volume
+            handle.sound.volume = 0.0 if fade_ms and int(fade_ms) > 0 else target_volume
+            handle.busy = True
+            handle.paused = False
+            handle.sound.play()
+            if fade_ms and int(fade_ms) > 0:
+                fade_duration = max(0.001, int(fade_ms) / 1000.0)
+                fade_started = time.perf_counter()
+                def fade_in(dt):
+                    ratio = min(1.0, (time.perf_counter() - fade_started) / fade_duration)
+                    handle.sound.volume = target_volume * ratio
+                    if ratio >= 1.0:
+                        handle.sound.volume = target_volume
+                        handle._volume_event = None
+                        return False
+                    return True
+                handle._volume_event = fade_in
+                Clock.schedule_interval(fade_in, 0.04)
+            if start:
+                try: handle.sound.seek(float(start))
+                except Exception: pass
+            if maxtime and int(maxtime) > 0:
+                def timed_stop(dt):
+                    self._audio_stop_main(handle)
+                handle._maxtime_event = timed_stop
+                Clock.schedule_once(timed_stop, max(0.001, int(maxtime) / 1000.0))
+        self._call_on_main(play_main)
+
+    def audio_stop(self, handle):
+        self._call_on_main(lambda: self._audio_stop_main(handle))
+
+    def audio_pause(self, handle):
+        def pause_main():
+            if not handle.busy or handle.paused:
+                return
+            try: position = max(0.0, float(handle.sound.get_pos()))
+            except Exception: position = 0.0
+            self._audio_stop_main(handle)
+            handle.position = position
+            handle.busy = True
+            handle.paused = True
+        self._call_on_main(pause_main)
+
+    def audio_unpause(self, handle):
+        def unpause_main():
+            if not handle.paused:
+                return
+            handle.sound.loop = handle.loop_forever
+            handle.sound.volume = handle.volume
+            handle.busy = True
+            handle.paused = False
+            handle.sound.play()
+            if handle.position:
+                try: handle.sound.seek(handle.position)
+                except Exception: pass
+        self._call_on_main(unpause_main)
+
+    def audio_set_volume(self, handle, volume):
+        def set_main():
+            handle.volume = max(0.0, min(1.0, float(volume)))
+            handle.sound.volume = handle.volume
+        self._call_on_main(set_main)
+
+    def audio_is_busy(self, handle):
+        def busy_main():
+            if not handle.busy or handle.paused:
+                return False
+            try:
+                if getattr(handle.sound, "state", "play") == "stop":
+                    handle.busy = False
+            except Exception:
+                pass
+            return bool(handle.busy)
+        return self._call_on_main(busy_main)
+
+    def audio_length(self, handle):
+        return self._call_on_main(lambda: float(getattr(handle.sound, "length", 0.0) or 0.0))
+
+    def audio_set_on_complete(self, handle, callback):
+        self._call_on_main(lambda: setattr(handle, "on_complete", callback))
+
+    def audio_position(self, handle):
+        def position_main():
+            if handle.paused:
+                return handle.position
+            try: return max(0.0, float(handle.sound.get_pos()))
+            except Exception: return 0.0
+        return self._call_on_main(position_main)
+
+    def audio_seek(self, handle, position):
+        def seek_main():
+            try: handle.sound.seek(max(0.0, float(position)))
+            except Exception: pass
+        self._call_on_main(seek_main)
+
+    def audio_fadeout(self, handle, milliseconds):
+        duration = max(0, int(milliseconds)) / 1000.0
+        def begin_fade():
+            if duration <= 0:
+                self._audio_stop_main(handle)
+                return
+            started = time.perf_counter()
+            initial = handle.volume
+            if handle._fade_event is not None:
+                Clock.unschedule(handle._fade_event)
+            if handle._volume_event is not None:
+                Clock.unschedule(handle._volume_event)
+                handle._volume_event = None
+            def step(dt):
+                elapsed = time.perf_counter() - started
+                ratio = min(1.0, elapsed / duration)
+                handle.sound.volume = initial * (1.0 - ratio)
+                if ratio >= 1.0:
+                    handle._fade_event = None
+                    self._audio_stop_main(handle)
+                    handle.sound.volume = initial
+                    return False
+                return True
+            handle._fade_event = step
+            Clock.schedule_interval(step, 0.04)
+        self._call_on_main(begin_fade)
+
+    def audio_unload(self, handle):
+        def unload_main():
+            self._audio_stop_main(handle)
+            try: handle.sound.unload()
+            except Exception: pass
+            self._audio_handles.discard(handle)
+        self._call_on_main(unload_main)
 
     # -- called from the game thread ------------------------------------------
     def screen_size(self):
@@ -175,6 +413,13 @@ class KivyHost:
         self._rendered.set()
 
     def close_main(self):
+        for handle in list(self._audio_handles):
+            try:
+                self._audio_stop_main(handle)
+                handle.sound.unload()
+            except Exception:
+                pass
+        self._audio_handles.clear()
         screen, self.screen = self.screen, None
         if screen is not None:
             screen.shutdown()

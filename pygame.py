@@ -7,14 +7,16 @@ It runs on Kivy and has no native code. Surfaces are recorded as drawing
 commands and replayed on the IDE's game screen (pygame_host.py) when
 display.flip() is called.
 
-Supported: Rect, Color, Surface (fill/blit/convert/subsurface, colorkey, alpha),
-draw (rect, circle, ellipse, line(s), polygon, arc), display, event, key,
-mouse (first finger), time (Clock, set_timer), font (Font, SysFont), image.load
-(PNG/JPG/GIF/BMP from the workspace), transform (scale, rotate, flip), sprite,
-math (Vector2/Vector3).
+Supported: Rect, Color, Surface pixel access (get_at/set_at/map_rgb), basic
+pixel reads from images and draw commands, draw primitives, display, input,
+font, image.load, transforms, mouse and multitouch finger events, masks
+(from_surface/from_threshold/overlap), sprite groups and pixel-perfect
+collide_mask. Pixel buffers and masks are
+memory-capped to keep use practical on lower-memory Android devices.
 
-Not supported: pixel access (get_at), masks, sound (silent stubs), joysticks,
-clipping to blit areas of drawn (non-image) surfaces, fullscreen/resizing.
+Partial/unsupported: some advanced pixel blend flags, SDL pixel formats,
+complex raster/text edge cases, advanced mixer features, joysticks, and several
+platform-specific display features.
 """
 
 import linecache as _linecache
@@ -1033,36 +1035,373 @@ class Vector3:
 # ----------------------------------------------------------------------
 # pygame.surface
 # ----------------------------------------------------------------------
-_SOURCES['surface'] = r'''"""pygame.Surface, recorded as a list of draw commands.
+_SOURCES['surface'] = r'''"""pygame.Surface with lazy RGBA pixel access and replayable draw commands.
 
-Instead of pixels, a Surface keeps the commands that were drawn on it. The IDE's
-game screen replays them with Kivy when display.flip() is called. A full
-fill() clears the history, so games that redraw every frame stay small.
-
-Command formats (colours are (r, g, b, a) int tuples):
-  ("fill", color)
-  ("rect", color, x, y, w, h, width, radius)
-  ("ellipse", color, x, y, w, h, width)
-  ("circle", color, cx, cy, r, width)
-  ("line", color, x1, y1, x2, y2, width)
-  ("lines", color, points, closed, width)
-  ("polygon", color, points, width)
-  ("arc", color, x, y, w, h, start, stop, width)
-  ("text", color, fontkey, text, x, y)
-  ("img", path, x, y, w, h, region)
-  ("group", commands, cx, cy, w, h, angle, sx, sy, alpha, colorkey)
+Normal drawing stays command-based for fast Kivy rendering. Pixel methods
+materialize a software RGBA buffer only when requested. The buffer is rebuilt
+from the command history after later drawing operations.
 """
 
+import math as _m
+import os as _os
+
 from . import _core
-from .color import rgba
+from .color import Color, rgba
 from .constants import SRCALPHA
 from .rect import Rect
+
+MAX_PIXEL_COUNT = 8 * 1024 * 1024  # cap lazy RGBA pixel buffers at 32 MiB
+_IMAGE_CACHE = {}
+_IMAGE_CACHE_BYTES = [0]
+_IMAGE_CACHE_LIMIT = 16 * 1024 * 1024
 
 
 def _pos(dest):
     if isinstance(dest, Rect):
         return dest.x, dest.y
     return dest[0], dest[1]
+
+
+def _blank_pixels(width, height, opaque=False):
+    count = width * height
+    if count > MAX_PIXEL_COUNT:
+        raise _core.error("Pixel access is limited to surfaces with at most %d pixels" % MAX_PIXEL_COUNT)
+    if opaque:
+        return bytearray((0, 0, 0, 255)) * count
+    return bytearray(count * 4)
+
+
+def _put(pixels, width, height, x, y, color, blend=False):
+    x, y = int(x), int(y)
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return
+    index = (y * width + x) * 4
+    r, g, b, a = color
+    if not blend or a >= 255:
+        pixels[index:index + 4] = bytes((r, g, b, a))
+    elif a > 0:
+        da = pixels[index + 3]
+        out_a = a + (da * (255 - a) + 127) // 255
+        if out_a:
+            inv = 255 - a
+            dr, dg, db = pixels[index:index + 3]
+            denom = out_a * 255
+            pixels[index] = (r * a * 255 + dr * da * inv + denom // 2) // denom
+            pixels[index + 1] = (g * a * 255 + dg * da * inv + denom // 2) // denom
+            pixels[index + 2] = (b * a * 255 + db * da * inv + denom // 2) // denom
+            pixels[index + 3] = out_a
+
+
+def _get(pixels, width, x, y):
+    index = (y * width + x) * 4
+    return tuple(pixels[index:index + 4])
+
+
+def _pixel_color(color, opaque):
+    return tuple(color[:3]) + (255,) if opaque else color
+
+
+def _load_image_pixels(path):
+    """Decode image pixels with Pillow when available, otherwise Kivy's provider."""
+    try:
+        stamp = (_os.path.getmtime(path), _os.path.getsize(path))
+    except OSError:
+        stamp = None
+    cached = _IMAGE_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1], cached[2], cached[3]
+
+    decoded = None
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as image:
+            image = image.convert("RGBA")
+            decoded = (image.width, image.height, image.tobytes())
+    except Exception:
+        try:
+            # ImageLoader retains decoded bytes without creating a GPU texture.
+            # That matters because user games execute in NovaGame's worker thread.
+            from kivy.core.image import ImageLoader as _ImageLoader
+            loaded = _ImageLoader.load(path, keep_data=True)
+            data = loaded._data[0]
+            iw, ih = int(data.width), int(data.height)
+            fmt = str(data.fmt).lower()
+            raw = data.data
+            rowlength = int(getattr(data, "rowlength", 0) or iw)
+            formats = {
+                "rgb": (3, (0, 1, 2, None)),
+                "bgr": (3, (2, 1, 0, None)),
+                "rgba": (4, (0, 1, 2, 3)),
+                "bgra": (4, (2, 1, 0, 3)),
+                "argb": (4, (1, 2, 3, 0)),
+                "abgr": (4, (3, 2, 1, 0)),
+            }
+            spec = formats.get(fmt)
+            if raw is None or spec is None:
+                raise ValueError("image provider did not retain a supported raw pixel format")
+            channels, order = spec
+            if rowlength < iw:
+                rowlength = iw
+            result = bytearray(iw * ih * 4)
+            for y in range(ih):
+                for x in range(iw):
+                    src = (y * rowlength + x) * channels
+                    dst = (y * iw + x) * 4
+                    result[dst] = raw[src + order[0]]
+                    result[dst + 1] = raw[src + order[1]]
+                    result[dst + 2] = raw[src + order[2]]
+                    result[dst + 3] = 255 if order[3] is None else raw[src + order[3]]
+            decoded = (iw, ih, bytes(result))
+        except Exception as exc:
+            # CoreImage is a compatibility fallback for providers that don't
+            # expose raw data through ImageLoader. It may need a graphics context.
+            try:
+                from kivy.core.image import Image as _CoreImage
+                image = _CoreImage(path, keep_data=True)
+                data = image.image._data[0]
+                iw, ih = int(data.width), int(data.height)
+                result = bytearray(iw * ih * 4)
+                for y in range(ih):
+                    for x in range(iw):
+                        color = image.read_pixel(x, y)
+                        values = tuple(int(max(0, min(1, float(v))) * 255 + 0.5)
+                                       for v in color)
+                        if len(values) == 3:
+                            values += (255,)
+                        dst = (y * iw + x) * 4
+                        result[dst:dst + 4] = bytes(values[:4])
+                decoded = (iw, ih, bytes(result))
+            except Exception as fallback_exc:
+                raise _core.error("Unable to read image pixels: %s (%s)" % (exc, fallback_exc))
+
+    if decoded is None:
+        raise _core.error("Unable to read image pixels: " + str(path))
+    iw, ih, pixels = decoded
+    if len(pixels) <= _IMAGE_CACHE_LIMIT:
+        while _IMAGE_CACHE and _IMAGE_CACHE_BYTES[0] + len(pixels) > _IMAGE_CACHE_LIMIT:
+            old_path = next(iter(_IMAGE_CACHE))
+            old = _IMAGE_CACHE.pop(old_path)
+            _IMAGE_CACHE_BYTES[0] -= len(old[3])
+        old = _IMAGE_CACHE.pop(path, None)
+        if old is not None:
+            _IMAGE_CACHE_BYTES[0] -= len(old[3])
+        _IMAGE_CACHE[path] = (stamp, iw, ih, pixels)
+        _IMAGE_CACHE_BYTES[0] += len(pixels)
+    return iw, ih, pixels
+
+
+def _line(pixels, width, height, color, a, b, stroke=1, blend=False):
+    x1, y1 = float(a[0]), float(a[1])
+    x2, y2 = float(b[0]), float(b[1])
+    radius = max(0.5, float(stroke) / 2.0)
+    min_x = max(0, int(_m.floor(min(x1, x2) - radius)))
+    max_x = min(width - 1, int(_m.ceil(max(x1, x2) + radius)))
+    min_y = max(0, int(_m.floor(min(y1, y2) - radius)))
+    max_y = min(height - 1, int(_m.ceil(max(y1, y2) + radius)))
+    vx, vy = x2 - x1, y2 - y1
+    length2 = vx * vx + vy * vy
+    limit = radius * radius
+    for py in range(min_y, max_y + 1):
+        for px in range(min_x, max_x + 1):
+            qx, qy = px + 0.5, py + 0.5
+            if length2:
+                t = max(0.0, min(1.0, ((qx - x1) * vx + (qy - y1) * vy) / length2))
+                dx, dy = qx - (x1 + t * vx), qy - (y1 + t * vy)
+            else:
+                dx, dy = qx - x1, qy - y1
+            if dx * dx + dy * dy <= limit:
+                _put(pixels, width, height, px, py, color, blend)
+
+
+def _polygon_contains(points, x, y):
+    inside = False
+    count = len(points)
+    j = count - 1
+    for i in range(count):
+        xi, yi = points[i]
+        xj, yj = points[j]
+        if ((yi > y) != (yj > y)) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-20) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _draw_image(pixels, width, height, path, x, y, draw_w, draw_h, region=None,
+                alpha=255, colorkey=None):
+    iw, ih, source = _load_image_pixels(path)
+    if region is None:
+        rx, ry, rw, rh = 0, 0, iw, ih
+    else:
+        rx, ry, rw, rh = [int(v) for v in region]
+    if rw <= 0 or rh <= 0 or draw_w <= 0 or draw_h <= 0:
+        return
+    x0, y0 = int(_m.floor(x)), int(_m.floor(y))
+    dw, dh = max(1, int(round(draw_w))), max(1, int(round(draw_h)))
+    for dy in range(max(0, y0), min(height, y0 + dh)):
+        sy = ry + min(rh - 1, max(0, int((dy - y) * rh / draw_h)))
+        if sy < 0 or sy >= ih:
+            continue
+        for dx in range(max(0, x0), min(width, x0 + dw)):
+            sx = rx + min(rw - 1, max(0, int((dx - x) * rw / draw_w)))
+            if sx < 0 or sx >= iw:
+                continue
+            color = _get(source, iw, sx, sy)
+            if colorkey is not None and color[:3] == tuple(colorkey[:3]):
+                continue
+            if alpha < 255:
+                color = color[:3] + ((color[3] * alpha + 127) // 255,)
+            _put(pixels, width, height, dx, dy, color, blend=True)
+
+
+def _raster_commands(width, height, commands, opaque=False):
+    pixels = _blank_pixels(width, height, opaque)
+    for command in commands:
+        if not command:
+            continue
+        kind = command[0]
+        if kind == "pixels":
+            raw = command[1]
+            expected = width * height * 4
+            if len(raw) == expected:
+                pixels[:] = raw
+        elif kind == "fill":
+            color = _pixel_color(command[1], opaque)
+            pixels[:] = bytes(color) * (width * height)
+        elif kind == "rect":
+            _, color, x, y, rw, rh, stroke, radius = command
+            color = _pixel_color(color, opaque)
+            x0, y0 = max(0, int(_m.floor(x))), max(0, int(_m.floor(y)))
+            x1, y1 = min(width, int(_m.ceil(x + rw))), min(height, int(_m.ceil(y + rh)))
+            for py in range(y0, y1):
+                for px in range(x0, x1):
+                    edge = (stroke <= 0 or px < x + stroke or px >= x + rw - stroke
+                            or py < y + stroke or py >= y + rh - stroke)
+                    if edge:
+                        _put(pixels, width, height, px, py, color)
+        elif kind == "circle":
+            _, color, cx, cy, radius, stroke = command
+            color = _pixel_color(color, opaque)
+            r = float(radius)
+            inner = max(0.0, r - max(1, int(stroke))) if stroke else -1
+            for py in range(max(0, int(cy-r-1)), min(height, int(cy+r+2))):
+                for px in range(max(0, int(cx-r-1)), min(width, int(cx+r+2))):
+                    d2 = (px + 0.5 - cx) ** 2 + (py + 0.5 - cy) ** 2
+                    if d2 <= r*r and (stroke <= 0 or d2 >= inner*inner):
+                        _put(pixels, width, height, px, py, color)
+        elif kind == "ellipse":
+            _, color, x, y, rw, rh, stroke = command
+            color = _pixel_color(color, opaque)
+            if rw <= 0 or rh <= 0:
+                continue
+            cx, cy = x + rw / 2.0, y + rh / 2.0
+            rx, ry = max(0.5, rw / 2.0), max(0.5, rh / 2.0)
+            inset_x = max(0.0, (rx - stroke)) if stroke else -1
+            inset_y = max(0.0, (ry - stroke)) if stroke else -1
+            for py in range(max(0, int(y)), min(height, int(_m.ceil(y+rh)))):
+                for px in range(max(0, int(x)), min(width, int(_m.ceil(x+rw)))):
+                    nx = (px + 0.5 - cx) / rx
+                    ny = (py + 0.5 - cy) / ry
+                    outer = nx*nx + ny*ny <= 1.0
+                    inner = (stroke <= 0 or inset_x <= 0 or inset_y <= 0
+                             or ((px+0.5-cx)/inset_x)**2 + ((py+0.5-cy)/inset_y)**2 >= 1.0)
+                    if outer and inner:
+                        _put(pixels, width, height, px, py, color)
+        elif kind == "line":
+            _, color, x1, y1, x2, y2, stroke = command
+            color = _pixel_color(color, opaque)
+            _line(pixels, width, height, color, (x1, y1), (x2, y2), stroke)
+        elif kind == "lines":
+            _, color, points, closed, stroke = command
+            color = _pixel_color(color, opaque)
+            for i in range(len(points)-1):
+                _line(pixels, width, height, color, points[i], points[i+1], stroke)
+            if closed and len(points) > 1:
+                _line(pixels, width, height, color, points[-1], points[0], stroke)
+        elif kind == "polygon":
+            _, color, points, stroke = command
+            color = _pixel_color(color, opaque)
+            if stroke:
+                for i in range(len(points)):
+                    _line(pixels, width, height, color, points[i], points[(i+1) % len(points)], stroke)
+            else:
+                min_x = max(0, int(_m.floor(min(p[0] for p in points))))
+                max_x = min(width, int(_m.ceil(max(p[0] for p in points))) + 1)
+                min_y = max(0, int(_m.floor(min(p[1] for p in points))))
+                max_y = min(height, int(_m.ceil(max(p[1] for p in points))) + 1)
+                for py in range(min_y, max_y):
+                    for px in range(min_x, max_x):
+                        if _polygon_contains(points, px + 0.5, py + 0.5):
+                            _put(pixels, width, height, px, py, color)
+        elif kind == "arc":
+            _, color, x, y, rw, rh, start, stop, stroke = command
+            color = _pixel_color(color, opaque)
+            if rw <= 0 or rh <= 0:
+                continue
+            steps = max(2, int(abs(stop-start) * max(rw, rh) / 8))
+            points = []
+            for index in range(steps + 1):
+                angle = start + (stop-start) * index / steps
+                points.append((x + rw/2 + _m.cos(angle)*rw/2,
+                               y + rh/2 - _m.sin(angle)*rh/2))
+            for index in range(len(points)-1):
+                _line(pixels, width, height, color, points[index], points[index+1], stroke)
+        elif kind == "img":
+            _, path, x, y, rw, rh, region = command
+            _draw_image(pixels, width, height, path, x, y, rw, rh, region)
+        elif kind == "text":
+            # Use Kivy's text provider when available; pixel access remains
+            # optional on environments without a text provider.
+            try:
+                _, color, fontkey, text, x, y = command
+                color = _pixel_color(color, opaque)
+                from kivy.core.text import Label as _CoreLabel
+                from pygame_render import TTF_LOCK as _TTF_LOCK
+                with _TTF_LOCK:
+                    label = _CoreLabel(text=text, font_size=fontkey[1],
+                                       bold=fontkey[2], italic=fontkey[3])
+                    label.refresh()
+                    texture = label.texture
+                    raw = bytes(texture.pixels)
+                    tw, th = texture.size
+                for py in range(int(th)):
+                    for px in range(int(tw)):
+                        idx = ((th - 1 - py) * tw + px) * 4
+                        a = raw[idx + 3]
+                        if a:
+                            _put(pixels, width, height, int(x)+px, int(y)+py,
+                                 color[:3] + (a,))
+            except Exception:
+                pass
+        elif kind == "group":
+            _, nested, cx, cy, sw, sh, angle, sx, sy, alpha, colorkey = command
+            if sw <= 0 or sh <= 0 or not sx or not sy:
+                continue
+            source = _raster_commands(max(1, int(sw)), max(1, int(sh)), nested, opaque=False)
+            rad = _m.radians(angle)
+            cs, sn = _m.cos(rad), _m.sin(rad)
+            corners = []
+            for ux, uy in ((-sw/2,-sh/2), (sw/2,-sh/2),
+                           (sw/2,sh/2), (-sw/2,sh/2)):
+                ux, uy = ux*sx, uy*sy
+                corners.append((cx + cs*ux - sn*uy, cy + sn*ux + cs*uy))
+            x0 = max(0, int(_m.floor(min(p[0] for p in corners))))
+            x1 = min(width, int(_m.ceil(max(p[0] for p in corners))))
+            y0 = max(0, int(_m.floor(min(p[1] for p in corners))))
+            y1 = min(height, int(_m.ceil(max(p[1] for p in corners))))
+            for py in range(y0, y1):
+                for px in range(x0, x1):
+                    dx, dy = px + 0.5 - cx, py + 0.5 - cy
+                    ux = (cs*dx + sn*dy) / sx + sw/2
+                    uy = (-sn*dx + cs*dy) / sy + sh/2
+                    ix, iy = int(ux), int(uy)
+                    if 0 <= ix < sw and 0 <= iy < sh:
+                        color = _get(source, int(sw), ix, iy)
+                        if colorkey is not None and color[:3] == tuple(colorkey[:3]):
+                            continue
+                        if alpha is not None:
+                            color = color[:3] + ((color[3] * int(alpha) + 127)//255,)
+                        _put(pixels, width, height, px, py, color, blend=True)
+    return pixels
 
 
 class Surface:
@@ -1079,26 +1418,46 @@ class Surface:
         self._srcalpha = bool(self._flags & SRCALPHA)
         self._cmds = [] if self._srcalpha else [("fill", (0, 0, 0, 255))]
         self._snap = None
+        self._pixels = None
+        self._pixel_dirty = False
+        self._revision = 0
         self._colorkey = None
         self._alpha = None
-        self._img = None          # (absolute path, region or None) for loaded images
+        self._img = None
         self._clip = None
         self._is_display = False
 
-    # -- command recording ----------------------------------------------------
+    def _flush_pixel_edits(self):
+        """Collapse direct pixel edits into one replayable framebuffer command."""
+        if self._pixel_dirty and self._pixels is not None:
+            self._cmds = [("pixels", bytes(self._pixels), self._w, self._h)]
+            self._pixel_dirty = False
+            self._snap = None
+            self._img = None
+
     def _add(self, command):
-        cmds = self._cmds
-        cmds.append(command)
+        # Preserve any get_at/set_at edits before recording later draw calls.
+        self._flush_pixel_edits()
+        self._cmds.append(command)
         self._snap = None
-        if len(cmds) > _core.MAX_COMMANDS:
-            del cmds[:len(cmds) - _core.MAX_COMMANDS // 2]
+        self._pixels = None
+        self._img = None
+        self._revision += 1
+        if len(self._cmds) > _core.MAX_COMMANDS:
+            del self._cmds[:len(self._cmds) - _core.MAX_COMMANDS // 2]
 
     def _snapshot(self):
+        self._flush_pixel_edits()
         if self._snap is None:
             self._snap = tuple(self._cmds)
         return self._snap
 
-    # -- basic information ---------------------------------------------------
+    def _pixel_data(self):
+        if self._pixels is None:
+            self._pixels = _raster_commands(self._w, self._h, self._cmds,
+                                           opaque=not self._srcalpha)
+        return self._pixels
+
     def get_size(self):
         return (self._w, self._h)
 
@@ -1123,17 +1482,53 @@ class Surface:
     def get_bytesize(self):
         return 4
 
+    def get_masks(self):
+        alpha_mask = 0xff000000 if self._srcalpha else 0
+        return (0x00ff0000, 0x0000ff00, 0x000000ff, alpha_mask)
+
+    def get_shifts(self):
+        return (16, 8, 0, 24 if self._srcalpha else 0)
+
+    def get_losses(self):
+        return (0, 0, 0, 0)
+
+    def map_rgb(self, color):
+        r, g, b, a = rgba(color)
+        value = (r << 16) | (g << 8) | b
+        return value | (a << 24) if self._srcalpha else value
+
+    def unmap_rgb(self, mapped):
+        value = int(mapped) & 0xffffffff
+        alpha = (value >> 24) & 255 if self._srcalpha else 255
+        return Color((value >> 16) & 255, (value >> 8) & 255,
+                     value & 255, alpha)
+
+    def get_at_mapped(self, pos):
+        return self.map_rgb(self.get_at(pos))
+
     def get_bounding_rect(self, min_alpha=1):
-        return Rect(0, 0, self._w, self._h)
+        pixels = self._pixel_data()
+        key = self._colorkey
+        threshold = max(0, int(min_alpha))
+        left, top, right, bottom = self._w, self._h, -1, -1
+        for y in range(self._h):
+            for x in range(self._w):
+                r, g, b, a = _get(pixels, self._w, x, y)
+                if a >= threshold and (key is None or (r, g, b) != key):
+                    left, top = min(left, x), min(top, y)
+                    right, bottom = max(right, x), max(bottom, y)
+        if right < left:
+            return Rect(0, 0, 0, 0)
+        return Rect(left, top, right-left+1, bottom-top+1)
 
     def get_clip(self):
         return self._clip or Rect(0, 0, self._w, self._h)
 
     def set_clip(self, rect=None):
-        self._clip = None if rect is None else Rect(rect)
+        self._clip = None if rect is None else Rect(rect).clip(Rect(0, 0, self._w, self._h))
 
     def lock(self):
-        pass
+        self._pixel_data()
 
     def unlock(self):
         pass
@@ -1144,15 +1539,16 @@ class Surface:
     def get_locked(self):
         return False
 
-    # -- colour key / alpha ------------------------------------------------------
     def set_colorkey(self, color, flags=0):
         self._colorkey = None if color is None else rgba(color)[:3]
+        self._revision += 1
 
     def get_colorkey(self):
         return None if self._colorkey is None else self._colorkey + (255,)
 
     def set_alpha(self, value, flags=0):
         self._alpha = None if value is None else max(0, min(255, int(value)))
+        self._revision += 1
 
     def get_alpha(self):
         return 255 if self._alpha is None else self._alpha
@@ -1173,16 +1569,24 @@ class Surface:
         other._alpha = self._alpha
         other._img = self._img
         other._srcalpha = self._srcalpha
+        other._pixels = None if self._pixels is None else bytearray(self._pixels)
+        other._pixel_dirty = self._pixel_dirty
+        other._revision = self._revision
         return other
 
     __copy__ = copy
 
-    # -- drawing ---------------------------------------------------------------------
     def fill(self, color, rect=None, special_flags=0):
         color = rgba(color)
+        if not self._srcalpha:
+            color = color[:3] + (255,)
         if rect is None:
-            del self._cmds[:]
+            self._cmds[:] = []
             self._snap = None
+            self._pixels = None
+            self._pixel_dirty = False
+            self._img = None
+            self._revision += 1
             if not (color[3] == 0 and self._srcalpha):
                 self._cmds.append(("fill", color))
             return Rect(0, 0, self._w, self._h)
@@ -1192,7 +1596,8 @@ class Surface:
 
     def blit(self, source, dest, area=None, special_flags=0):
         dx, dy = _pos(dest)
-        if source._img is not None and source._alpha is None:
+        if (source._img is not None and source._alpha is None
+                and source._colorkey is None):
             path, region = source._img
             if area is not None:
                 ax, ay, aw, ah = Rect(area)
@@ -1222,15 +1627,33 @@ class Surface:
         return results if doreturn else None
 
     def set_at(self, pos, color):
-        self._add(("rect", rgba(color), pos[0], pos[1], 1, 1, 0, 0))
+        x, y = int(pos[0]), int(pos[1])
+        if not (0 <= x < self._w and 0 <= y < self._h):
+            raise IndexError("pixel index out of range")
+        if not self.get_clip().collidepoint((x, y)):
+            return
+        color = rgba(color)
+        if not self._srcalpha:
+            color = color[:3] + (255,)
+        pixels = self._pixel_data()
+        _put(pixels, self._w, self._h, x, y, color)
+        # Keep the pixel buffer authoritative. _snapshot() emits one compact
+        # framebuffer command, rather than one drawing command per pixel.
+        self._pixel_dirty = True
+        self._snap = None
+        self._img = None
+        self._revision += 1
 
     def get_at(self, pos):
-        raise _core.error(
-            "get_at() isn't supported by the IDE's pygame layer "
-            "(surfaces are recorded as drawing commands, not pixels)")
+        x, y = int(pos[0]), int(pos[1])
+        if not (0 <= x < self._w and 0 <= y < self._h):
+            raise IndexError("pixel index out of range")
+        return Color(*_get(self._pixel_data(), self._w, x, y))
 
     def subsurface(self, *rect):
         rect = Rect(*rect)
+        if rect.x < 0 or rect.y < 0 or rect.right > self._w or rect.bottom > self._h:
+            raise ValueError("subsurface rectangle outside surface area")
         sub = Surface((rect.w, rect.h), self._flags | SRCALPHA)
         if self._img is not None:
             path, region = self._img
@@ -1246,12 +1669,25 @@ class Surface:
         return sub
 
     def scroll(self, dx=0, dy=0):
-        _core.notice("Surface.scroll() isn't supported and was ignored.")
+        dx, dy = int(dx), int(dy)
+        pixels = self._pixel_data()
+        old_pixels = bytearray(pixels)
+        pixels[:] = b"\x00" * len(pixels)
+        for y in range(self._h):
+            for x in range(self._w):
+                sx, sy = x - dx, y - dy
+                if 0 <= sx < self._w and 0 <= sy < self._h:
+                    si, di = (sy*self._w+sx)*4, (y*self._w+x)*4
+                    pixels[di:di+4] = old_pixels[si:si+4]
+        self._cmds = []
+        self._pixel_dirty = True
+        self._snap = None
+        self._img = None
+        self._revision += 1
 
     def __repr__(self):
         return "<Surface(%dx%dx32 SW)>" % (self._w, self._h)
 '''
-
 # ----------------------------------------------------------------------
 # pygame.draw
 # ----------------------------------------------------------------------
@@ -1943,18 +2379,22 @@ def SysFont(name, size, bold=False, italic=False):
 # ----------------------------------------------------------------------
 # pygame.image
 # ----------------------------------------------------------------------
-_SOURCES['image'] = r'''"""pygame.image: loads files from the working folder (the IDE's workspace)."""
+_SOURCES['image'] = r'''"""Image loading, byte conversion, and PNG/JPEG saving helpers."""
 
+import io
 import os
 import struct
+import tempfile
+import zlib
+import binascii
 
 from . import _core
 from .constants import SRCALPHA
-from .surface import Surface
+from .surface import Surface, MAX_PIXEL_COUNT, _load_image_pixels
 
 
 def _image_size(path):
-    """Read (width, height) from an image file header (PNG, JPEG, GIF, BMP)."""
+    """Read image dimensions without decoding the full image."""
     with open(path, "rb") as handle:
         head = handle.read(32)
         if head[:8] == b"\x89PNG\r\n\x1a\n":
@@ -1979,20 +2419,102 @@ def _image_size(path):
                 length = struct.unpack(">H", length_bytes)[0]
                 if 0xC0 <= code <= 0xCF and code not in (0xC4, 0xC8, 0xCC):
                     data = handle.read(5)
-                    height, width = struct.unpack(">HH", data[1:5])
-                    return width, height
-                handle.seek(length - 2, 1)
-    raise _core.error("Unsupported image format (use PNG, JPG, GIF or BMP): " + path)
+                    if len(data) == 5:
+                        height, width = struct.unpack(">HH", data[1:5])
+                        return width, height
+                    break
+                handle.seek(max(0, length - 2), 1)
+    raise _core.error("Unsupported image format (use PNG, JPG, GIF or BMP): " + str(path))
+
+
+def _surface_from_rgba(width, height, pixels):
+    width, height = int(width), int(height)
+    expected = width * height * 4
+    if width < 0 or height < 0 or width * height > MAX_PIXEL_COUNT:
+        raise _core.error("Image exceeds NovaGame's pixel memory limit")
+    if len(pixels) != expected:
+        raise ValueError("RGBA image data has the wrong size")
+    surface = Surface((width, height), SRCALPHA)
+    surface._pixels = bytearray(pixels)
+    surface._pixel_dirty = True
+    surface._cmds = []
+    surface._snap = None
+    surface._img = None
+    return surface
+
+
+def _guess_suffix(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"): return ".png"
+    if data.startswith(b"\xff\xd8"): return ".jpg"
+    if data.startswith(b"GIF8"): return ".gif"
+    if data.startswith(b"BM"): return ".bmp"
+    return ".img"
+
+
+def _decode_bytes(data, suffix=None):
+    """Decode image bytes to top-down RGBA without relying on a GL context."""
+    suffix = suffix or _guess_suffix(data)
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(io.BytesIO(data)) as image:
+            if image.width * image.height > MAX_PIXEL_COUNT:
+                raise _core.error("Image exceeds NovaGame's pixel memory limit")
+            image.load()
+            image = image.convert("RGBA")
+            return image.width, image.height, image.tobytes()
+    except _core.error:
+        raise
+    except Exception as pillow_error:
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(data)
+                path = handle.name
+            width, height, pixels = _load_image_pixels(path)
+            return width, height, pixels
+        except Exception as fallback_error:
+            raise _core.error("Unable to decode image data: %s (%s)" %
+                              (pillow_error, fallback_error))
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def load(filename, namehint=""):
+    """Load an image path, bytes object, or readable binary file object."""
+    if isinstance(filename, (bytes, bytearray, memoryview)):
+        data = bytes(filename)
+        suffix = str(namehint or _guess_suffix(data))
+        width, height, pixels = _decode_bytes(data, suffix)
+        return _surface_from_rgba(width, height, pixels)
+
     if hasattr(filename, "read"):
-        raise _core.error("Loading images from file objects isn't supported")
-    path = os.path.abspath(str(filename))
+        data = filename.read()
+        if isinstance(data, str):
+            raise TypeError("image file object must be opened in binary mode")
+        filename_hint = getattr(filename, "name", "")
+        suffix = str(namehint or os.path.splitext(str(filename_hint))[1] or _guess_suffix(bytes(data)))
+        width, height, pixels = _decode_bytes(bytes(data), suffix)
+        return _surface_from_rgba(width, height, pixels)
+
+    path = os.path.abspath(os.fspath(filename))
     if not os.path.isfile(path):
         raise FileNotFoundError(
             "No file '%s' found in working directory '%s'." % (filename, os.getcwd()))
-    width, height = _image_size(path)
+    # Validate the image header here; pixel decode and GPU texture upload remain
+    # lazy for path-based loads so ordinary image blits stay inexpensive.
+    with open(path, "rb") as handle:
+        head = handle.read(32)
+    if not (head[:8] == b"\x89PNG\r\n\x1a\n" or head[:4] == b"GIF8" or
+            head[:2] == b"BM" or head[:2] == b"\xff\xd8"):
+        raise _core.error("Unsupported image format: " + path)
+    try:
+        width, height = _image_size(path)
+    except Exception as exc:
+        raise _core.error("Unable to read image: %s" % exc)
     surface = Surface((width, height), SRCALPHA)
     surface._cmds = [("img", path, 0, 0, width, height, None)]
     surface._img = (path, None)
@@ -2002,8 +2524,116 @@ def load(filename, namehint=""):
 load_extended = load
 
 
+def _png_chunk(kind, payload):
+    checksum = binascii.crc32(kind + payload) & 0xffffffff
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+
+def _write_png(surface, fileobj):
+    width, height = surface.get_size()
+    if width <= 0 or height <= 0:
+        raise ValueError("PNG images must have positive width and height")
+    pixels = surface._pixel_data()
+    row_bytes = width * 4
+    raw = bytearray()
+    for y in range(height):
+        start = y * row_bytes
+        raw.append(0)  # PNG filter: None
+        raw.extend(pixels[start:start + row_bytes])
+    fileobj.write(b"\x89PNG\r\n\x1a\n")
+    fileobj.write(_png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)))
+    compressed = zlib.compress(bytes(raw), 6)
+    fileobj.write(_png_chunk(b"IDAT", compressed))
+    fileobj.write(_png_chunk(b"IEND", b""))
+
+
 def save(surface, filename, namehint=""):
-    _core.notice("image.save() isn't supported and was ignored.")
+    """Save a Surface. PNG is always supported; Pillow enables other formats."""
+    if not isinstance(surface, Surface):
+        raise TypeError("image.save expects a Surface")
+    fileobj = filename if hasattr(filename, "write") else None
+    path = None if fileobj is not None else os.fspath(filename)
+    ext = (str(namehint) or os.path.splitext(str(path or getattr(fileobj, "name", "")))[1]).lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if ext in ("", ".png"):
+        if fileobj is not None:
+            _write_png(surface, fileobj)
+        else:
+            with open(path, "wb") as handle:
+                _write_png(surface, handle)
+        return
+    try:
+        from PIL import Image as _PILImage
+    except Exception as exc:
+        raise _core.error("Saving %s requires Pillow; PNG saving is built in" % ext) from exc
+    width, height = surface.get_size()
+    image = _PILImage.frombytes("RGBA", (width, height), bytes(surface._pixel_data()))
+    fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP", ".gif": "GIF"}.get(ext)
+    if fmt is None:
+        raise _core.error("Unsupported output image format: " + ext)
+    if fmt == "JPEG":
+        image = image.convert("RGB")
+    if fileobj is not None:
+        image.save(fileobj, format=fmt)
+    else:
+        image.save(path, format=fmt)
+
+
+def tostring(surface, format, flipped=False):
+    fmt = str(format).upper()
+    if fmt not in ("RGB", "RGBA", "ARGB", "BGRA", "RGBX"):
+        raise ValueError("unsupported image byte format: " + fmt)
+    width, height = surface.get_size()
+    pixels = surface._pixel_data()
+    rows = range(height - 1, -1, -1) if flipped else range(height)
+    result = bytearray()
+    for y in rows:
+        for x in range(width):
+            i = (y * width + x) * 4
+            r, g, b, a = pixels[i:i+4]
+            if fmt == "RGB": result.extend((r, g, b))
+            elif fmt == "RGBA": result.extend((r, g, b, a))
+            elif fmt == "ARGB": result.extend((a, r, g, b))
+            elif fmt == "BGRA": result.extend((b, g, r, a))
+            else: result.extend((r, g, b, 255))
+    return bytes(result)
+
+
+tobytes = tostring
+
+
+def fromstring(data, size, format, flipped=False):
+    fmt = str(format).upper()
+    if fmt not in ("RGB", "RGBA", "ARGB", "BGRA", "RGBX"):
+        raise ValueError("unsupported image byte format: " + fmt)
+    width, height = int(size[0]), int(size[1])
+    if width < 0 or height < 0:
+        raise ValueError("image size must be non-negative")
+    if width * height > MAX_PIXEL_COUNT:
+        raise _core.error("Image exceeds NovaGame's pixel memory limit")
+    channels = 3 if fmt == "RGB" else 4
+    raw = bytes(data)
+    if len(raw) != width * height * channels:
+        raise ValueError("byte data length does not match image size")
+    pixels = bytearray(width * height * 4)
+    source_rows = range(height - 1, -1, -1) if flipped else range(height)
+    cursor = 0
+    for y in source_rows:
+        for x in range(width):
+            if fmt == "RGB": r, g, b = raw[cursor:cursor+3]; a = 255
+            elif fmt == "RGBA": r, g, b, a = raw[cursor:cursor+4]
+            elif fmt == "ARGB": a, r, g, b = raw[cursor:cursor+4]
+            elif fmt == "BGRA": b, g, r, a = raw[cursor:cursor+4]
+            else: r, g, b, _x = raw[cursor:cursor+4]; a = 255
+            cursor += channels
+            dst = (y * width + x) * 4
+            pixels[dst:dst+4] = bytes((r, g, b, a))
+    return _surface_from_rgba(width, height, pixels)
+
+
+frombytes = fromstring
+frombuffer = fromstring
 
 
 def get_extended():
@@ -2017,6 +2647,7 @@ _SOURCES['transform'] = r'''"""pygame.transform: scale, rotate and flip are appl
 
 import math as _m
 
+from . import _core
 from .constants import SRCALPHA
 from .surface import Surface
 
@@ -2043,12 +2674,63 @@ def scale(surface, size, dest_surface=None):
     return out
 
 
-smoothscale = scale
+def smoothscale(surface, size, dest_surface=None):
+    """Bilinearly resize a Surface into a new RGBA pixel buffer."""
+    width, height = int(size[0]), int(size[1])
+    if width < 0 or height < 0:
+        raise ValueError("smoothscale size must be non-negative")
+    if width * height > 8 * 1024 * 1024:
+        raise _core.error("smoothscale output exceeds NovaGame's pixel limit")
+    out = Surface((width, height), SRCALPHA)
+    if width and height and surface._w and surface._h:
+        source = surface._pixel_data()
+        target = bytearray(width * height * 4)
+        for y in range(height):
+            fy = max(0.0, min(surface._h - 1.0,
+                              (y + 0.5) * surface._h / float(height) - 0.5))
+            y0 = int(_m.floor(fy))
+            y1 = min(surface._h - 1, y0 + 1)
+            wy = fy - y0
+            for x in range(width):
+                fx = max(0.0, min(surface._w - 1.0,
+                                  (x + 0.5) * surface._w / float(width) - 0.5))
+                x0 = int(_m.floor(fx))
+                x1 = min(surface._w - 1, x0 + 1)
+                wx = fx - x0
+                i00 = (y0 * surface._w + x0) * 4
+                i10 = (y0 * surface._w + x1) * 4
+                i01 = (y1 * surface._w + x0) * 4
+                i11 = (y1 * surface._w + x1) * 4
+                oi = (y * width + x) * 4
+                for channel in range(4):
+                    top = source[i00 + channel] * (1.0 - wx) + source[i10 + channel] * wx
+                    bottom = source[i01 + channel] * (1.0 - wx) + source[i11 + channel] * wx
+                    target[oi + channel] = max(0, min(255, int(
+                        top * (1.0 - wy) + bottom * wy + 0.5)))
+        out._pixels = target
+        out._pixel_dirty = True
+        out._cmds = []
+    if dest_surface is not None:
+        if dest_surface.get_size() != (width, height):
+            raise ValueError("destination Surface has the wrong size")
+        dest_surface._pixels = bytearray(out._pixel_data())
+        dest_surface._pixel_dirty = True
+        dest_surface._cmds = []
+        dest_surface._snap = None
+        dest_surface._img = None
+        dest_surface._revision += 1
+        return dest_surface
+    return out
 
 
 def scale_by(surface, factor, dest_surface=None):
     fx, fy = (factor, factor) if isinstance(factor, (int, float)) else factor
     return scale(surface, (int(surface._w * fx), int(surface._h * fy)), dest_surface)
+
+
+def smoothscale_by(surface, factor, dest_surface=None):
+    fx, fy = (factor, factor) if isinstance(factor, (int, float)) else factor
+    return smoothscale(surface, (int(surface._w * fx), int(surface._h * fy)), dest_surface)
 
 
 def flip(surface, flip_x, flip_y):
@@ -2077,6 +2759,366 @@ def scale2x(surface, dest_surface=None):
     return scale(surface, (surface._w * 2, surface._h * 2), dest_surface)
 '''
 
+
+# ----------------------------------------------------------------------
+# pygame.mask
+# ----------------------------------------------------------------------
+_SOURCES['mask'] = r'''"""pygame.mask: binary pixel masks and pixel-perfect overlap tests."""
+
+import math as _m
+from array import array as _array
+
+from .rect import Rect
+from .color import rgba
+from .surface import Surface, _put
+
+MAX_MASK_PIXELS = 8 * 1024 * 1024
+MAX_COMPONENT_MASK_BYTES = 32 * 1024 * 1024
+
+
+class Mask:
+    def __init__(self, size, fill=False):
+        width, height = int(size[0]), int(size[1])
+        if width < 0 or height < 0:
+            raise ValueError("invalid mask size")
+        if width * height > MAX_MASK_PIXELS:
+            raise MemoryError("mask is too large")
+        self._w, self._h = width, height
+        self._bits = bytearray([1 if fill else 0]) * (width * height)
+
+    def get_size(self):
+        return (self._w, self._h)
+
+    def get_at(self, pos):
+        x, y = int(pos[0]), int(pos[1])
+        if not (0 <= x < self._w and 0 <= y < self._h):
+            raise IndexError("mask index out of range")
+        return int(self._bits[y * self._w + x])
+
+    def set_at(self, pos, value=1):
+        x, y = int(pos[0]), int(pos[1])
+        if not (0 <= x < self._w and 0 <= y < self._h):
+            raise IndexError("mask index out of range")
+        self._bits[y * self._w + x] = 1 if value else 0
+
+    def fill(self):
+        self._bits[:] = b"\x01" * len(self._bits)
+
+    def clear(self):
+        self._bits[:] = b"\x00" * len(self._bits)
+
+    def invert(self):
+        for i, value in enumerate(self._bits):
+            self._bits[i] = 0 if value else 1
+
+    def count(self):
+        return self._bits.count(1)
+
+    def copy(self):
+        other = Mask((self._w, self._h))
+        other._bits[:] = self._bits
+        return other
+
+    def overlap(self, other, offset):
+        ox, oy = int(offset[0]), int(offset[1])
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(self._w, ox + other._w), min(self._h, oy + other._h)
+        if x0 >= x1 or y0 >= y1:
+            return None
+        for y in range(y0, y1):
+            a = y * self._w + x0
+            b = (y - oy) * other._w + (x0 - ox)
+            for x in range(x1 - x0):
+                if self._bits[a + x] and other._bits[b + x]:
+                    return (x0 + x, y)
+        return None
+
+    def overlap_area(self, other, offset):
+        ox, oy = int(offset[0]), int(offset[1])
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(self._w, ox + other._w), min(self._h, oy + other._h)
+        total = 0
+        if x0 >= x1 or y0 >= y1:
+            return 0
+        span = x1 - x0
+        for y in range(y0, y1):
+            a = y * self._w + x0
+            b = (y - oy) * other._w + (x0 - ox)
+            for x in range(span):
+                total += bool(self._bits[a+x] and other._bits[b+x])
+        return total
+
+    def overlap_mask(self, other, offset):
+        ox, oy = int(offset[0]), int(offset[1])
+        result = Mask((self._w, self._h))
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(self._w, ox + other._w), min(self._h, oy + other._h)
+        for y in range(y0, y1):
+            a = y * self._w + x0
+            b = (y - oy) * other._w + (x0 - ox)
+            for x in range(x1 - x0):
+                if self._bits[a+x] and other._bits[b+x]:
+                    result._bits[a+x] = 1
+        return result
+
+    def draw(self, other, offset):
+        ox, oy = int(offset[0]), int(offset[1])
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(self._w, ox + other._w), min(self._h, oy + other._h)
+        for y in range(y0, y1):
+            a = y * self._w + x0
+            b = (y - oy) * other._w + (x0 - ox)
+            for x in range(x1 - x0):
+                if other._bits[b+x]:
+                    self._bits[a+x] = 1
+
+    def erase(self, other, offset):
+        ox, oy = int(offset[0]), int(offset[1])
+        x0, y0 = max(0, ox), max(0, oy)
+        x1, y1 = min(self._w, ox + other._w), min(self._h, oy + other._h)
+        for y in range(y0, y1):
+            a = y * self._w + x0
+            b = (y - oy) * other._w + (x0 - ox)
+            for x in range(x1 - x0):
+                if other._bits[b+x]:
+                    self._bits[a+x] = 0
+
+    def outline(self, every=1):
+        step = max(1, int(every))
+        points = []
+        boundary_index = 0
+        for y in range(self._h):
+            row = y * self._w
+            for x in range(self._w):
+                index = row + x
+                if not self._bits[index]:
+                    continue
+                if (x == 0 or x == self._w-1 or y == 0 or y == self._h-1
+                        or not self._bits[index-1] or not self._bits[index+1]
+                        or not self._bits[index-self._w] or not self._bits[index+self._w]):
+                    if boundary_index % step == 0:
+                        points.append((x, y))
+                    boundary_index += 1
+        return points
+
+    def centroid(self):
+        count = sx = sy = 0
+        for y in range(self._h):
+            row = y * self._w
+            for x in range(self._w):
+                if self._bits[row+x]:
+                    count += 1
+                    sx += x
+                    sy += y
+        return (int(sx/count), int(sy/count)) if count else (-1, -1)
+
+    def angle(self):
+        count = sx = sy = 0
+        for y in range(self._h):
+            row = y * self._w
+            for x in range(self._w):
+                if self._bits[row+x]:
+                    count += 1
+                    sx += x
+                    sy += y
+        if count < 2:
+            return 0.0
+        cx, cy = sx / count, sy / count
+        xx = yy = xy = 0.0
+        for y in range(self._h):
+            row = y * self._w
+            for x in range(self._w):
+                if self._bits[row+x]:
+                    dx, dy = x-cx, y-cy
+                    xx += dx*dx
+                    yy += dy*dy
+                    xy += dx*dy
+        return _m.degrees(0.5 * _m.atan2(2*xy, xx-yy))
+
+    def get_bounding_rects(self, threshold=1):
+        """Return one bounding rectangle per 4-connected component."""
+        minimum = max(1, int(threshold))
+        seen = bytearray(len(self._bits))
+        rects = []
+        for start, value in enumerate(self._bits):
+            if not value or seen[start]:
+                continue
+            stack = _array("I", [start])
+            seen[start] = 1
+            count = 0
+            left = right = start % self._w
+            top = bottom = start // self._w
+            while stack:
+                index = stack.pop()
+                count += 1
+                x, y = index % self._w, index // self._w
+                left, right = min(left, x), max(right, x)
+                top, bottom = min(top, y), max(bottom, y)
+                for nx, ny in ((x-1,y), (x+1,y), (x,y-1), (x,y+1)):
+                    if 0 <= nx < self._w and 0 <= ny < self._h:
+                        ni = ny*self._w+nx
+                        if self._bits[ni] and not seen[ni]:
+                            seen[ni] = 1
+                            stack.append(ni)
+            if count >= minimum:
+                rects.append(Rect(left, top, right-left+1, bottom-top+1))
+        return rects
+
+    def get_bounding_rect(self):
+        left, top, right, bottom = self._w, self._h, -1, -1
+        for y in range(self._h):
+            row = y * self._w
+            for x in range(self._w):
+                if self._bits[row+x]:
+                    left, top = min(left, x), min(top, y)
+                    right, bottom = max(right, x), max(bottom, y)
+        if right < left:
+            return Rect(0, 0, 0, 0)
+        return Rect(left, top, right-left+1, bottom-top+1)
+
+    def connected_components(self, min=0):
+        """Return separate 4-connected component masks, with a memory guard."""
+        minimum = max(0, int(min))
+        seen = bytearray(len(self._bits))
+        components = []
+        mask_bytes = len(self._bits)
+        for start, value in enumerate(self._bits):
+            if not value or seen[start]:
+                continue
+            stack = _array("I", [start])
+            seen[start] = 1
+            component_bits = bytearray(mask_bytes)
+            component_bits[start] = 1
+            count = 0
+            while stack:
+                index = stack.pop()
+                count += 1
+                x, y = index % self._w, index // self._w
+                for nx, ny in ((x-1,y), (x+1,y), (x,y-1), (x,y+1)):
+                    if 0 <= nx < self._w and 0 <= ny < self._h:
+                        ni = ny*self._w+nx
+                        if self._bits[ni] and not seen[ni]:
+                            seen[ni] = 1
+                            component_bits[ni] = 1
+                            stack.append(ni)
+            if count >= minimum:
+                if (len(components) + 1) * mask_bytes > MAX_COMPONENT_MASK_BYTES:
+                    raise MemoryError(
+                        "connected_components() result exceeds NovaGame's memory limit")
+                component = Mask((self._w, self._h))
+                component._bits[:] = component_bits
+                components.append(component)
+        return components
+
+    def connected_component(self, pos):
+        x, y = int(pos[0]), int(pos[1])
+        if not (0 <= x < self._w and 0 <= y < self._h) or not self._bits[y*self._w+x]:
+            return Mask((self._w, self._h))
+        result = Mask((self._w, self._h))
+        start = y*self._w+x
+        stack = _array("I", [start])
+        result._bits[start] = 1
+        while stack:
+            index = stack.pop()
+            px, py = index % self._w, index // self._w
+            for nx, ny in ((px-1,py), (px+1,py), (px,py-1), (px,py+1)):
+                if 0 <= nx < self._w and 0 <= ny < self._h:
+                    ni = ny*self._w+nx
+                    if self._bits[ni] and not result._bits[ni]:
+                        result._bits[ni] = 1
+                        stack.append(ni)
+        return result
+
+    def scale(self, size):
+        nw, nh = max(0, int(size[0])), max(0, int(size[1]))
+        out = Mask((nw, nh))
+        if not self._w or not self._h or not nw or not nh:
+            return out
+        for y in range(nh):
+            sy = min(self._h-1, int(y * self._h / nh))
+            for x in range(nw):
+                sx = min(self._w-1, int(x * self._w / nw))
+                out._bits[y*nw+x] = self._bits[sy*self._w+sx]
+        return out
+
+    def to_surface(self, surface=None, setcolor=(255,255,255,255),
+                   unsetcolor=None, dest=None):
+        if surface is None:
+            surface = Surface((self._w, self._h), 65536)
+        ox, oy = (0, 0) if dest is None else (int(dest[0]), int(dest[1]))
+        set_rgba = rgba(setcolor) if setcolor is not None else None
+        unset_rgba = rgba(unsetcolor) if unsetcolor is not None else None
+        pixels = surface._pixel_data()
+        for y in range(self._h):
+            x = 0
+            while x < self._w:
+                value = self._bits[y*self._w+x]
+                color = set_rgba if value else unset_rgba
+                run = x + 1
+                while run < self._w and self._bits[y*self._w+run] == value:
+                    run += 1
+                if color is not None:
+                    for px in range(x, run):
+                        tx, ty = ox+px, oy+y
+                        if 0 <= tx < surface._w and 0 <= ty < surface._h:
+                            _put(pixels, surface._w, surface._h, tx, ty, color)
+                x = run
+        surface._pixels = pixels
+        surface._pixel_dirty = True
+        surface._snap = None
+        surface._img = None
+        surface._revision += 1
+        return surface
+
+    def __repr__(self):
+        return "<Mask(%d, %d) set=%d>" % (self._w, self._h, self.count())
+
+
+def from_surface(surface, threshold=127):
+    mask = Mask(surface.get_size())
+    pixels = surface._pixel_data()
+    key = surface._colorkey
+    threshold = int(threshold)
+    for y in range(surface._h):
+        for x in range(surface._w):
+            index = (y*surface._w+x)*4
+            r, g, b, a = pixels[index:index+4]
+            opaque = ((r, g, b) != key) if key is not None else (a > threshold)
+            if opaque:
+                mask._bits[y*surface._w+x] = 1
+    return mask
+
+
+def from_threshold(surface, color, threshold=(0,0,0,0), othersurface=None,
+                   palette_colors=1):
+    target = tuple(color) if hasattr(color, "__iter__") else (color,)
+    if len(target) == 3:
+        target = target + (255,)
+    target = tuple(int(v) for v in target[:4])
+    if isinstance(threshold, (int, float)):
+        limits = (int(threshold),) * 4
+    else:
+        limits = tuple(int(v) for v in threshold)
+        if len(limits) == 3:
+            limits += (255,)
+        if len(limits) < 4:
+            limits = limits + (0,) * (4-len(limits))
+    first = surface._pixel_data()
+    second = othersurface._pixel_data() if othersurface is not None else None
+    if othersurface is not None and othersurface.get_size() != surface.get_size():
+        raise ValueError("surfaces must have the same size")
+    mask = Mask(surface.get_size())
+    for index in range(surface._w * surface._h):
+        p = tuple(first[index*4:index*4+4])
+        if second is not None:
+            q = tuple(second[index*4:index*4+4])
+            candidate = tuple(abs(p[i]-q[i]) for i in range(4))
+        else:
+            candidate = p
+        if all(abs(candidate[i]-target[i]) <= max(0, limits[i]) for i in range(4)):
+            mask._bits[index] = 1
+    return mask
+'''
 # ----------------------------------------------------------------------
 # pygame.sprite
 # ----------------------------------------------------------------------
@@ -2085,6 +3127,7 @@ _SOURCES['sprite'] = r'''"""pygame.sprite: Sprite, groups and collision helpers.
 import math as _m
 
 from .rect import Rect
+from .mask import from_surface as _mask_from_surface
 
 
 class Sprite:
@@ -2379,7 +3422,33 @@ class collide_circle_ratio:
 
 
 def collide_mask(left, right):
-    return left.rect.colliderect(right.rect)
+    """Pixel-perfect collision; returns the first overlap point or None."""
+    if left.rect is None or right.rect is None or not left.rect.colliderect(right.rect):
+        return None
+    left_mask = getattr(left, "mask", None)
+    right_mask = getattr(right, "mask", None)
+    if left_mask is None:
+        image = getattr(left, "image", None)
+        if image is None:
+            return None
+        cache = getattr(left, "_novagame_mask_cache", None)
+        revision = getattr(image, "_revision", None)
+        if cache is None or cache[0] is not image or cache[1] != revision:
+            cache = (image, revision, _mask_from_surface(image))
+            left._novagame_mask_cache = cache
+        left_mask = cache[2]
+    if right_mask is None:
+        image = getattr(right, "image", None)
+        if image is None:
+            return None
+        cache = getattr(right, "_novagame_mask_cache", None)
+        revision = getattr(image, "_revision", None)
+        if cache is None or cache[0] is not image or cache[1] != revision:
+            cache = (image, revision, _mask_from_surface(image))
+            right._novagame_mask_cache = cache
+        right_mask = cache[2]
+    offset = (int(right.rect.x - left.rect.x), int(right.rect.y - left.rect.y))
+    return left_mask.overlap(right_mask, offset)
 
 
 def spritecollide(sprite, group, dokill, collided=None):
@@ -2413,172 +3482,414 @@ def spritecollideany(sprite, group, collided=None):
 # ----------------------------------------------------------------------
 # pygame.mixer
 # ----------------------------------------------------------------------
-_SOURCES['mixer'] = r'''"""pygame.mixer: silent stand-ins, so games that play sounds still run."""
+_SOURCES['mixer'] = r'''"""Kivy-backed pygame.mixer compatibility."""
 
+import os as _os
 import sys as _sys
+import tempfile as _tempfile
 
 from . import _core
 
 _initialized = [True]
+_frequency = [44100]
+_size = [-16]
+_channels_count = [2]
+_master_volume = [1.0]
+_channels = []
+_sounds = set()
+_temp_paths = set()
 
 
-def _silent():
-    _core.notice("Audio isn't supported in the IDE; sounds and music are silent.")
+def _host():
+    host = _core.host
+    if host is None or not hasattr(host, "audio_load"):
+        raise _core.error("Audio playback is unavailable: pygame_host audio support is missing")
+    return host
 
 
-def init(*args, **kwargs):
+def _path_for_source(source, buffer=None, suffix=None):
+    if buffer is not None:
+        raw = bytes(buffer)
+        suffix = suffix or ".wav"
+        path = None
+        try:
+            with _tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                handle.write(raw)
+                path = handle.name
+            _temp_paths.add(path)
+            return path
+        except Exception:
+            if path:
+                try: _os.unlink(path)
+                except OSError: pass
+            raise
+    if hasattr(source, "read"):
+        raw = source.read()
+        suffix = _os.path.splitext(str(getattr(source, "name", "")))[1] or ".wav"
+        return _path_for_source(None, raw, suffix=suffix)
+    if source is None:
+        raise TypeError("Sound requires a filename or buffer")
+    return _os.path.abspath(_os.fspath(source))
+
+
+def init(frequency=None, size=None, channels=None, buffer=512, devicename=None):
+    _frequency[0] = int(_frequency[0] if frequency is None else frequency)
+    _size[0] = int(_size[0] if size is None else size)
+    _channels_count[0] = max(1, int(_channels_count[0] if channels is None else channels))
     _initialized[0] = True
+    set_num_channels(8)
 
 
-def pre_init(*args, **kwargs):
-    pass
+def pre_init(frequency=44100, size=-16, channels=2, buffer=512, devicename=None):
+    _frequency[0], _size[0], _channels_count[0] = int(frequency), int(size), int(channels)
 
 
 def quit():
     _initialized[0] = False
+    music.unload()
+    for channel in list(_channels):
+        channel.stop()
+    for sound in list(_sounds):
+        sound._unload()
+    for path in list(_temp_paths):
+        try: _os.unlink(path)
+        except OSError: pass
+    _temp_paths.clear()
 
 
 def get_init():
-    return (44100, -16, 2) if _initialized[0] else None
+    return (_frequency[0], _size[0], _channels_count[0]) if _initialized[0] else None
 
 
 def set_num_channels(count):
-    pass
+    count = max(0, int(count))
+    while len(_channels) < count:
+        _channels.append(Channel(len(_channels)))
+    while len(_channels) > count:
+        _channels.pop().stop()
 
 
 def get_num_channels():
-    return 8
+    return len(_channels)
+
+
+def set_reserved(count):
+    pass
 
 
 def stop():
-    pass
+    for channel in list(_channels): channel.stop()
 
 
 def pause():
-    pass
+    for channel in list(_channels): channel.pause()
 
 
 def unpause():
-    pass
+    for channel in list(_channels): channel.unpause()
 
 
-def fadeout(time):
-    pass
+def fadeout(milliseconds):
+    for channel in list(_channels): channel.fadeout(milliseconds)
 
 
 def get_busy():
-    return False
+    return any(channel.get_busy() for channel in _channels)
 
 
 class Channel:
+    def __new__(cls, id=0):
+        try:
+            index = int(id)
+            if 0 <= index < len(_channels) and isinstance(_channels[index], cls):
+                return _channels[index]
+        except Exception:
+            pass
+        return super().__new__(cls)
+
     def __init__(self, id=0):
-        self.id = id
+        if getattr(self, "_channel_initialized", False):
+            return
+        self.id = int(id)
+        self._sound = None
+        self._handle = None
+        self._owns_handle = False
+        self._volume = 1.0
+        self._paused = False
+        self._channel_initialized = True
 
     def play(self, sound, loops=0, maxtime=0, fade_ms=0):
-        pass
+        if not _initialized[0]:
+            raise _core.error("mixer not initialized")
+        if not isinstance(sound, Sound):
+            raise TypeError("Channel.play expects a mixer.Sound")
+        self.stop()
+        host = _host()
+        # pygame allows one Sound to play on several channels simultaneously.
+        # Kivy Sound instances represent one playback, so give overlapping
+        # channels their own provider instance while keeping the first on the
+        # Sound's reusable base handle.
+        already_active = any(
+            channel is not self and channel._handle is not None and
+            (channel._paused or host.audio_is_busy(channel._handle))
+            for channel in list(sound._channels)
+        )
+        handle = host.audio_load(sound._path) if already_active else sound._handle
+        if handle is None:
+            raise _core.error("Unable to create an audio playback channel")
+        self._sound = sound
+        self._handle = handle
+        self._owns_handle = handle is not sound._handle
+        sound._channels.add(self)
+        volume = max(0.0, min(1.0, sound._volume * self._volume * _master_volume[0]))
+        try:
+            host.audio_set_volume(handle, volume)
+            host.audio_play(handle, loops=int(loops), maxtime=int(maxtime),
+                            fade_ms=int(fade_ms), start=0.0)
+        except Exception:
+            sound._channels.discard(self)
+            if self._owns_handle:
+                try: host.audio_unload(handle)
+                except Exception: pass
+            self._sound = None
+            self._handle = None
+            self._owns_handle = False
+            raise
+        self._paused = False
+        return self
 
     def stop(self):
-        pass
+        if self._sound is not None:
+            handle = self._handle
+            try:
+                if handle is not None:
+                    _host().audio_stop(handle)
+                    if self._owns_handle:
+                        _host().audio_unload(handle)
+            except Exception:
+                pass
+            self._sound._channels.discard(self)
+        self._sound = None
+        self._handle = None
+        self._owns_handle = False
+        self._paused = False
 
     def pause(self):
-        pass
+        if self._handle is not None:
+            _host().audio_pause(self._handle)
+            self._paused = True
 
     def unpause(self):
-        pass
+        if self._handle is not None and self._paused:
+            _host().audio_unpause(self._handle)
+            self._paused = False
 
     def set_volume(self, *volume):
-        pass
+        if not volume: return
+        self._volume = max(0.0, min(1.0, sum(float(v) for v in volume) / len(volume)))
+        if self._handle is not None and self._sound is not None:
+            _host().audio_set_volume(self._handle,
+                self._volume * self._sound._volume * _master_volume[0])
 
     def get_volume(self):
-        return 1.0
+        return self._volume
 
     def get_busy(self):
-        return False
+        if self._handle is None: return False
+        return _host().audio_is_busy(self._handle)
 
-    def fadeout(self, time):
-        pass
+    def get_sound(self):
+        return self._sound
+
+    def get_queue(self):
+        return None
+
+    def fadeout(self, milliseconds):
+        if self._handle is not None:
+            _host().audio_fadeout(self._handle, int(milliseconds))
+
+    def get_id(self):
+        return self.id
 
 
 class Sound:
     def __init__(self, file=None, buffer=None):
-        _silent()
+        if not _initialized[0]:
+            raise _core.error("mixer not initialized")
+        self._path = _path_for_source(file, buffer)
         self._volume = 1.0
+        self._channels = set()
+        self._handle = _host().audio_load(self._path)
+        if self._handle is None:
+            raise _core.error("Unable to load audio file: " + self._path)
+        _sounds.add(self)
 
     def play(self, loops=0, maxtime=0, fade_ms=0):
-        _silent()
-        return Channel()
+        channel = find_channel()
+        if channel is None:
+            return None
+        return channel.play(self, loops, maxtime, fade_ms)
 
     def stop(self):
-        pass
+        for channel in list(self._channels): channel.stop()
+        if not self._channels:
+            _host().audio_stop(self._handle)
 
-    def fadeout(self, time):
-        pass
+    def fadeout(self, milliseconds):
+        for channel in list(self._channels): channel.fadeout(milliseconds)
 
     def set_volume(self, value):
-        self._volume = value
+        self._volume = max(0.0, min(1.0, float(value)))
+        for channel in list(self._channels):
+            channel.set_volume(channel._volume)
 
     def get_volume(self):
         return self._volume
 
     def get_length(self):
-        return 0.0
+        return float(_host().audio_length(self._handle))
 
     def get_num_channels(self):
-        return 0
+        return sum(1 for channel in self._channels if channel.get_busy())
 
     def get_raw(self):
-        return b""
+        try:
+            with open(self._path, "rb") as handle: return handle.read()
+        except OSError:
+            return b""
+
+    def _unload(self):
+        for channel in list(self._channels): channel.stop()
+        if self._handle is not None:
+            try: _host().audio_unload(self._handle)
+            except Exception: pass
+            self._handle = None
+        _sounds.discard(self)
+
+
+_channels[:] = [Channel(i) for i in range(8)]
 
 
 def find_channel(force=False):
-    return Channel()
+    for channel in _channels:
+        if not channel.get_busy():
+            return channel
+    return _channels[0] if force and _channels else None
+
+
+def set_volume(value):
+    _master_volume[0] = max(0.0, min(1.0, float(value)))
+    for channel in _channels:
+        if channel._sound is not None:
+            channel.set_volume(channel._volume)
+
+
+def get_sdl_mixer_version(linked=True):
+    return (2, 6, 0)
+
+
+def get_sdl_audio_driver():
+    return "kivy"
 
 
 class _Music:
     def __init__(self):
+        self._sound = None
+        self._channel = Channel(-1)
         self._volume = 1.0
+        self._queue_sound = None
+        self._queue_loops = 0
 
     def load(self, filename, namehint=""):
-        _silent()
+        self.stop()
+        if self._sound is not None: self._sound._unload()
+        if self._queue_sound is not None: self._queue_sound._unload()
+        self._queue_sound = None
+        self._sound = Sound(filename)
+        self._sound.set_volume(self._volume)
 
     def unload(self):
-        pass
+        self.stop()
+        if self._sound is not None:
+            self._sound._unload()
+            self._sound = None
+        if self._queue_sound is not None:
+            self._queue_sound._unload()
+            self._queue_sound = None
+
+    def _play_queued(self):
+        queued = self._queue_sound
+        if queued is None:
+            return
+        loops = self._queue_loops
+        old = self._sound
+        self._queue_sound = None
+        self._sound = queued
+        self._sound.set_volume(self._volume)
+        self._channel.play(self._sound, loops=loops)
+        if old is not None and old is not queued:
+            old._unload()
+        if self._queue_sound is not None and self._channel._handle is not None:
+            _host().audio_set_on_complete(self._channel._handle, self._play_queued)
 
     def play(self, loops=0, start=0.0, fade_ms=0):
-        _silent()
+        if self._sound is None:
+            raise _core.error("music.load() must be called before music.play()")
+        self._channel.play(self._sound, loops=loops, fade_ms=fade_ms)
+        if self._channel._handle is not None:
+            _host().audio_set_on_complete(
+                self._channel._handle,
+                self._play_queued if self._queue_sound is not None else None)
+            if start:
+                _host().audio_seek(self._channel._handle, float(start))
 
     def stop(self):
-        pass
+        if self._channel._handle is not None:
+            try: _host().audio_set_on_complete(self._channel._handle, None)
+            except Exception: pass
+        self._channel.stop()
 
     def pause(self):
-        pass
+        self._channel.pause()
 
     def unpause(self):
-        pass
+        self._channel.unpause()
 
     def rewind(self):
-        pass
+        if self._sound is not None:
+            self._channel.stop()
+            self.play()
 
-    def fadeout(self, time):
-        pass
+    def fadeout(self, milliseconds):
+        self._channel.fadeout(milliseconds)
 
     def set_volume(self, value):
-        self._volume = value
+        self._volume = max(0.0, min(1.0, float(value)))
+        if self._sound is not None:
+            self._sound.set_volume(self._volume)
 
     def get_volume(self):
         return self._volume
 
     def get_busy(self):
-        return False
+        return self._channel.get_busy()
 
     def get_pos(self):
-        return -1
+        if self._sound is None or self._channel._handle is None or not self.get_busy(): return -1
+        return int(_host().audio_position(self._channel._handle) * 1000)
 
     def set_pos(self, pos):
-        pass
+        if self._channel._handle is not None:
+            _host().audio_seek(self._channel._handle, float(pos))
 
     def queue(self, filename, namehint="", loops=0):
-        pass
+        if self._queue_sound is not None:
+            self._queue_sound._unload()
+        self._queue_sound = Sound(filename)
+        self._queue_sound.set_volume(self._volume)
+        self._queue_loops = int(loops)
+        if self._sound is not None and self._channel._handle is not None and self.get_busy():
+            _host().audio_set_on_complete(self._channel._handle, self._play_queued)
 
 
 music = _Music()
@@ -2612,7 +3923,7 @@ from .surface import Surface  # noqa: F401
 '''
 
 
-_ORDER = ['_core', 'constants', 'color', 'rect', 'math', 'surface', 'draw', 'event', 'key', 'mouse', 'time', 'display', 'font', 'image', 'transform', 'sprite', 'mixer', 'version', 'locals']
+_ORDER = ['_core', 'constants', 'color', 'rect', 'math', 'surface', 'draw', 'event', 'key', 'mouse', 'time', 'display', 'font', 'image', 'transform', 'mask', 'sprite', 'mixer', 'version', 'locals']
 _self = _sys.modules[__name__]
 
 
@@ -2650,13 +3961,15 @@ def init():
     _core.initialized = True
     display.init()
     font.init()
-    return (5, 0)
+    mixer.init()
+    return (6, 0)
 
 
 def quit():
     _core.initialized = False
     display.quit()
     font.quit()
+    mixer.quit()
     for callback in list(_quit_callbacks):
         callback()
 

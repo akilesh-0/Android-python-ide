@@ -460,7 +460,8 @@ class SmartCodeInput(CodeInput):
         if (len(substring) == 1 and not from_undo
                 and not getattr(self, "_is_pasting", False)):
             char = substring
-            has_selection = bool(self.selection)
+            has_selection = bool(self.selection_text)
+            cursor_index = 0
             try:
                 cursor_index = self.cursor_index()
                 next_char = self.text[cursor_index:cursor_index + 1]
@@ -473,6 +474,20 @@ class SmartCodeInput(CodeInput):
                 return
 
             if char in PAIRS:
+                # Quotes inside words are apostrophes/embedded quotes, not
+                # opening delimiters (for example: don't and # it's fine).
+                # Keep bracket pairing independent of this quote-only rule.
+                previous_char = self.text[cursor_index - 1:cursor_index] if cursor_index else ""
+                is_quote = char in ("'", '"')
+                quote_follows_word = bool(
+                    not has_selection and previous_char and
+                    (previous_char.isalnum() or previous_char == "_"
+                     or previous_char in ("'", '"'))
+                )
+                if is_quote and quote_follows_word:
+                    super().insert_text(char, from_undo=from_undo)
+                    return
+
                 # Reuse a matching closer already at the cursor. Otherwise add
                 # a new closer. Selected text is wrapped by the pair.
                 closing = PAIRS[char]
@@ -1569,8 +1584,9 @@ class PythonIDE(App):
         elif symbol == "PASTE":
             editor.paste()
         elif symbol in PAIRS:
-            editor.insert_text(symbol + PAIRS[symbol])
-            editor.do_cursor_movement("cursor_left")
+            # Let SmartCodeInput apply the same quote-context rules used by
+            # physical keyboard input (and pair brackets consistently).
+            editor.insert_text(symbol)
         else:
             editor.insert_text(symbol)
         editor.focus = True
