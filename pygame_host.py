@@ -705,6 +705,10 @@ class DPad(Widget):
         return True
 
     def on_touch_move(self, touch):
+        # A finger may still be grabbed by the DPad when PAD is switched off.
+        # Do not let a disabled overlay continue changing virtual key state.
+        if self.disabled:
+            return False
         if touch.grab_current is self:
             self._touches[touch.uid] = self._keys_at(*touch.pos)
             self._push()
@@ -789,6 +793,10 @@ class GameScreen(ModalView):
             bar.add_widget(widget)
 
         field = FloatLayout()
+        # Keep a reference so the PAD overlays can be removed from the widget
+        # tree when disabled. Opacity=0 and disabled=True alone do not
+        # guarantee that overlapping controls will pass touches through.
+        self.field = field
         self.view = GameView(host, size_hint=(1, 1))
         self.dpad = DPad(host, size_hint=(None, None), size=(dp(168), dp(168)),
                          pos_hint={"x": 0.02, "y": 0.03})
@@ -828,10 +836,29 @@ class GameScreen(ModalView):
 
     def _update_pad(self, instance, state):
         visible = state == "down"
+
         for widget in self.pad_widgets:
-            widget.opacity = 1 if visible else 0
-            widget.disabled = not visible
+            if visible:
+                # Reinsert the controls only while PAD is enabled.
+                if widget.parent is None:
+                    self.field.add_widget(widget)
+                widget.disabled = False
+                widget.opacity = 1
+            else:
+                # Remove the overlays entirely so they cannot intercept game
+                # touches while PAD is off.
+                widget.disabled = True
+                widget.opacity = 0
+                if getattr(widget, "state", "normal") == "down":
+                    widget.state = "normal"
+                if widget.parent is self.field:
+                    self.field.remove_widget(widget)
+
         if not visible:
+            # Clear any held DPad state and release all virtual keys.
+            self.dpad._touches.clear()
+            self.dpad.keys.clear()
+            self.dpad.redraw()
             self.host.pad_keys("dpad", set())
             self.host.pad_keys(("button", C.K_SPACE), set())
             self.host.pad_keys(("button", C.K_RETURN), set())
