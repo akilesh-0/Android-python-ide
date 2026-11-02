@@ -8,6 +8,7 @@ import linecache
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -33,6 +34,7 @@ from kivy.uix.textinput import TextInput
 from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
+from android_storage import AndroidStorageBridge, StorageBridgeError
 
 # ----------------------------------------------------------------------
 # Settings
@@ -169,6 +171,33 @@ def format_size(size):
     if size < 1024:
         return f"{size} B"
     return f"{size / 1024:.1f} KB"
+
+
+def clean_explorer_name(name):
+    """Validate a single project item name (file or directory component)."""
+    name = str(name).strip()
+    if not name or name in (".", ".."):
+        raise ValueError("Enter a valid name.")
+    if len(name) > 180:
+        raise ValueError("Names must be 180 characters or fewer.")
+    if INVALID_NAME_CHARS.search(name):
+        raise ValueError('A name cannot contain / \\: * ? " < > | or control characters.')
+    if name.endswith((".", " ")):
+        raise ValueError("Names cannot end with a dot or space.")
+    return name
+
+
+def is_path_inside(root, path, allow_root=True):
+    """Return whether path resolves inside root without following outside links."""
+    root = os.path.realpath(os.path.abspath(root))
+    path = os.path.realpath(os.path.abspath(path))
+    try:
+        common = os.path.commonpath((root, path))
+    except (ValueError, OSError):
+        return False
+    if common != root:
+        return False
+    return allow_root or path != root
 
 
 # ----------------------------------------------------------------------
@@ -375,7 +404,7 @@ class FdCapture:
         self.read_fd = None
 
 
-HOLD_SECONDS = 0.4  # press-and-hold time that starts normal text selection
+HOLD_SECONDS = 0.5  # press-and-hold selects a word on touch screens
 
 
 class SmartCodeInput(CodeInput):
@@ -383,7 +412,8 @@ class SmartCodeInput(CodeInput):
 
     A quick tap places the cursor and opens the keyboard. Dragging scrolls in
     both directions (with a little momentum) without touching the keyboard.
-    Press-and-hold falls back to normal TextInput selection.
+    Press-and-hold selects the word under the finger, then lets Kivy's
+    selection handles and drag-selection behaviour take over.
     """
 
     def __init__(self, **kwargs):
@@ -460,12 +490,15 @@ class SmartCodeInput(CodeInput):
         if (len(substring) == 1 and not from_undo
                 and not getattr(self, "_is_pasting", False)):
             char = substring
+            # TextInput.selection is an internal state object and can be truthy
+            # even when no visible text is selected. Use the selected text itself.
             has_selection = bool(self.selection_text)
-            cursor_index = 0
             try:
                 cursor_index = self.cursor_index()
+                previous_char = self.text[cursor_index - 1:cursor_index]
                 next_char = self.text[cursor_index:cursor_index + 1]
             except Exception:
+                previous_char = ""
                 next_char = ""
 
             # Typing an existing closer moves over it instead of duplicating it.
@@ -474,17 +507,13 @@ class SmartCodeInput(CodeInput):
                 return
 
             if char in PAIRS:
-                # Quotes inside words are apostrophes/embedded quotes, not
-                # opening delimiters (for example: don't and # it's fine).
-                # Keep bracket pairing independent of this quote-only rule.
-                previous_char = self.text[cursor_index - 1:cursor_index] if cursor_index else ""
-                is_quote = char in ("'", '"')
-                quote_follows_word = bool(
-                    not has_selection and previous_char and
-                    (previous_char.isalnum() or previous_char == "_"
-                     or previous_char in ("'", '"'))
-                )
-                if is_quote and quote_follows_word:
+                # Apostrophes inside words (for example, don't) are ordinary
+                # characters, not the start of a quoted string. A quote escaped
+                # by a backslash should also be inserted literally.
+                if (char in ("'", '"') and not has_selection
+                        and (previous_char == "\\"
+                             or previous_char == "_"
+                             or previous_char.isalnum())):
                     super().insert_text(char, from_undo=from_undo)
                     return
 
@@ -576,11 +605,48 @@ class SmartCodeInput(CodeInput):
         return True
 
     def _hold_touch(self, touch, dt):
-        # Finger stayed down without moving: hand over to normal TextInput
-        # behaviour (selection handles, copy/paste bubble).
+        # A stationary long press should select text, not start scrolling.
+        # First let TextInput place the cursor at the finger position, then
+        # select the word on the next frame (focus changes can clear selection).
         if touch.ud.get("ide_mode") == "pending":
             touch.ud["ide_mode"] = "forwarded"
             CodeInput.on_touch_down(self, touch)
+            Clock.schedule_once(lambda _dt: self.select_word_at_cursor(), 0.05)
+
+    def select_word_at_cursor(self):
+        """Select the identifier/word under the current editor cursor."""
+        text = self.text
+        if not text:
+            return False
+        try:
+            index = self.cursor_index()
+        except Exception:
+            return False
+        index = max(0, min(index, len(text) - 1))
+
+        def is_word_char(char):
+            return char == "_" or char.isalnum()
+
+        # A cursor just after a word should select that word, too.
+        if not is_word_char(text[index]) and index > 0 and is_word_char(text[index - 1]):
+            index -= 1
+
+        if is_word_char(text[index]):
+            start = index
+            end = index + 1
+            while start > 0 and is_word_char(text[start - 1]):
+                start -= 1
+            while end < len(text) and is_word_char(text[end]):
+                end += 1
+        else:
+            # For punctuation, select the single character under the cursor.
+            start, end = index, index + 1
+
+        try:
+            self.select_text(start, end)
+            return True
+        except Exception:
+            return False
 
     def on_touch_move(self, touch):
         mode = touch.ud.get("ide_mode")
@@ -768,15 +834,43 @@ class PythonIDE(App):
         Window.clearcolor = C_BG
         Window.softinput_mode = ""  # we lift the layout above the keyboard ourselves
 
-        # Workspace: app-private folder, so no storage permissions are needed.
-        self.workspace = os.path.join(self.user_data_dir, "workspace")
-        os.makedirs(self.workspace, exist_ok=True)
-        try:
-            os.chdir(self.workspace)  # relative paths in user code land here
-        except OSError:
-            pass
-        if self.workspace not in sys.path:
-            sys.path.insert(0, self.workspace)  # saved files can import each other
+        # Default app-private workspace is always available, even before a
+        # project folder is selected. An imported project gets its own private
+        # mirror and becomes the active editor/runtime workspace.
+        self.default_workspace = os.path.join(self.user_data_dir, "workspace")
+        os.makedirs(self.default_workspace, exist_ok=True)
+        self.workspace = self.default_workspace
+        self.active_project_root = None
+        self._explorer_current_dir = self.workspace
+
+        # Android Storage Access Framework: Stage 1/2 grants persistent access;
+        # Stage 3 imports the selected tree into a private mirror. If that mirror
+        # already exists, resume using it after an app restart.
+        self.storage_bridge = AndroidStorageBridge(
+            self.user_data_dir,
+            platform_name=platform,
+            on_folder_selected=self.on_project_folder_selected,
+            on_error=self.on_project_folder_error,
+        )
+        self.project_folder = self.storage_bridge.get_saved_folder()
+        if self.project_folder:
+            try:
+                cached_project = self.storage_bridge.project_cache_path(
+                    record=self.project_folder
+                )
+                if os.path.isdir(cached_project):
+                    self.active_project_root = cached_project
+                    self.workspace = cached_project
+            except Exception:
+                pass
+
+        self._explorer_current_dir = self.workspace
+
+        # Keep the default workspace importable for the built-in file workflow.
+        if self.default_workspace not in sys.path:
+            sys.path.insert(0, self.default_workspace)
+        self._project_import_thread = None
+        self._project_sync_thread = None
 
         self.input_queue = queue.Queue()
         self.worker = None            # thread of the currently running program
@@ -812,8 +906,6 @@ class PythonIDE(App):
 
         root.add_widget(self.build_app_bar())
         root.add_widget(divider())
-        root.add_widget(self.build_file_toolbar())
-        root.add_widget(divider())
         root.add_widget(self.build_symbol_bar())
         root.add_widget(self.build_editor_area())
         root.add_widget(self.build_console())
@@ -841,31 +933,26 @@ class PythonIDE(App):
         self.tab_label = make_label(size=14, markup=True, bold=True)
         bar.add_widget(self.tab_label)
 
+        self.file_button = FlatButton(
+            text="FILE", bg=C_BTN, size_hint_x=None, width=dp(54),
+            font_size=sp(12),
+        )
+        self.file_button.bind(on_release=self.show_file_menu)
+        self.edit_button = FlatButton(
+            text="EDIT", bg=C_BTN, size_hint_x=None, width=dp(54),
+            font_size=sp(12),
+        )
+        self.edit_button.bind(on_release=self.show_edit_menu)
         self.run_button = IconButton("play", bg=C_RUN, size_hint_x=None,
-                                     width=dp(60))
+                                     width=dp(56))
         self.run_button.bind(on_release=self.run_code)
         self.stop_button = IconButton("stop", bg=C_STOP, size_hint_x=None,
-                                      width=dp(60), disabled=True)
+                                      width=dp(56), disabled=True)
         self.stop_button.bind(on_release=self.stop_code)
+        bar.add_widget(self.file_button)
+        bar.add_widget(self.edit_button)
         bar.add_widget(self.run_button)
         bar.add_widget(self.stop_button)
-        return bar
-
-    def build_file_toolbar(self):
-        bar = BoxLayout(size_hint_y=None, height=dp(38),
-                        padding=[dp(6), dp(3)], spacing=dp(4))
-        paint(bar, C_BAR)
-
-        def add(text, callback):
-            button = FlatButton(text=text, bg=C_BAR, font_size=sp(12))
-            button.bind(on_release=callback)
-            bar.add_widget(button)
-            return button
-
-        add("NEW", lambda *a: self.guard_unsaved(self.new_file))
-        add("OPEN", lambda *a: self.guard_unsaved(self.show_open_dialog))
-        self.save_button = add("SAVE", lambda *a: self.save_file())
-        add("SAVE AS", lambda *a: self.show_save_as())
         return bar
 
     def build_symbol_bar(self):
@@ -909,6 +996,8 @@ class PythonIDE(App):
             extra["do_wrap"] = False  # keep one visual row per line number
         if hasattr(TextInput, "keyboard_suggestions"):
             extra["keyboard_suggestions"] = False  # no autocorrect in code
+        if hasattr(TextInput, "use_handles"):
+            extra["use_handles"] = True  # draggable selection handles on mobile
 
         self.editor = SmartCodeInput(
             text=SAMPLE_CODE,
@@ -1039,6 +1128,8 @@ class PythonIDE(App):
         self.close_game_screen()
         self.save_session()
         self.stop_capture()
+        if getattr(self, "storage_bridge", None) is not None:
+            self.storage_bridge.unbind()
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         raise_in_thread(self.worker, StopRun)
@@ -1074,6 +1165,14 @@ class PythonIDE(App):
             self.guard_unsaved(self.new_file)
         elif letter == "r":
             self.run_code(None)
+        elif letter == "a":
+            self.select_all_text()
+        elif letter == "c":
+            self.copy_selection()
+        elif letter == "x":
+            self.cut_selection()
+        elif letter == "v":
+            self.paste_clipboard()
         else:
             return False
         return True
@@ -1146,7 +1245,7 @@ class PythonIDE(App):
     def update_tab(self):
         dot = DIRTY_DOT if self.dirty else ""
         self.tab_label.text = dot + escape_markup(self.current_name())
-        self.save_button.color = C_ACCENT if self.dirty else C_TEXT
+        self.file_button.color = C_ACCENT if self.dirty else C_TEXT
 
     def update_cursor(self, *args):
         col, row = self.editor.cursor
@@ -1241,6 +1340,7 @@ class PythonIDE(App):
     def save_session(self, *args):
         data = {
             "path": self.current_path,
+            "workspace": self.workspace,
             "dirty": self.dirty,
             "text": self.editor.text if self.dirty else None,
         }
@@ -1256,8 +1356,17 @@ class PythonIDE(App):
         except Exception:
             return
         path = data.get("path")
-        if path and not os.path.isfile(path):
-            path = None
+        if path:
+            try:
+                path_abs = os.path.abspath(path)
+                root_abs = os.path.abspath(self.workspace)
+                inside_workspace = os.path.commonpath((path_abs, root_abs)) == root_abs
+            except (TypeError, ValueError, OSError):
+                inside_workspace = False
+            if not inside_workspace or not os.path.isfile(path_abs):
+                path = None
+            else:
+                path = path_abs
         if data.get("dirty") and isinstance(data.get("text"), str):
             self.set_editor_text(data["text"])
             self.current_path = path
@@ -1343,6 +1452,486 @@ class PythonIDE(App):
             ],
         )
 
+    def choose_project_folder(self):
+        """Launch the Android system picker for a persistent project folder."""
+        if platform != "android":
+            self.show_message(
+                "Android storage",
+                "Choose Project Folder is available when this IDE runs on Android."
+            )
+            return
+        if self.worker is not None:
+            self.show_message(
+                "Program is running",
+                "Stop the running program before changing the project folder."
+            )
+            return
+        if (self._project_import_thread is not None
+                and self._project_import_thread.is_alive()):
+            self.show_message(
+                "Project import running",
+                "Wait for the current project import to finish before choosing another folder."
+            )
+            return
+        if (self._project_sync_thread is not None
+                and self._project_sync_thread.is_alive()):
+            self.show_message(
+                "Project sync running",
+                "Wait for synchronization to finish before changing the selected folder."
+            )
+            return
+        try:
+            self.storage_bridge.select_project_folder()
+            self.flash("Choose a project folder in the Android picker")
+        except StorageBridgeError as exc:
+            self.show_message("Could not select project folder", str(exc))
+
+    def on_project_folder_selected(self, folder):
+        """Receive a folder selection after Android has persisted its grant."""
+        def apply_selection(_dt):
+            self.project_folder = dict(folder)
+            self.flash("Project folder selected: %s" % folder.get("name", "Folder"))
+        Clock.schedule_once(apply_selection, 0)
+
+    def on_project_folder_error(self, message):
+        Clock.schedule_once(
+            lambda _dt: self.show_message("Project folder access", message), 0
+        )
+
+    def import_project_folder(self):
+        """Import the selected SAF tree into the IDE's private project mirror."""
+        if platform != "android":
+            self.show_message(
+                "Android storage",
+                "Project import is available when the IDE runs on Android."
+            )
+            return
+        if self.worker is not None:
+            self.show_message(
+                "Program is running",
+                "Stop the running program before importing a project."
+            )
+            return
+        if (self._project_import_thread is not None
+                and self._project_import_thread.is_alive()):
+            self.flash("A project import is already running.")
+            return
+        if (self._project_sync_thread is not None
+                and self._project_sync_thread.is_alive()):
+            self.flash("Wait for project synchronization to finish.")
+            return
+
+        folder = self.storage_bridge.get_saved_folder()
+        if not folder:
+            self.show_message("No project folder", "Choose a project folder first.")
+            return
+        if not self.storage_bridge.has_persisted_permission(folder):
+            self.show_message(
+                "Project access expired",
+                "Choose the project folder again to restore Android storage access."
+            )
+            return
+
+        self.guard_unsaved(partial(self._confirm_project_import, folder))
+
+    def _confirm_project_import(self, folder):
+        try:
+            target = self.storage_bridge.project_cache_path(record=folder)
+        except Exception as exc:
+            self.show_message("Project import", str(exc))
+            return
+
+        if os.path.isdir(target) and os.listdir(target):
+            self.show_dialog(
+                "Replace local project copy?",
+                "Importing again replaces the private copy with the selected "
+                "storage folder. Local edits not yet synchronized back may be lost.",
+                [
+                    ("Cancel", None, "neutral"),
+                    ("Re-import", lambda: self._start_project_import(folder, target), "danger"),
+                ],
+                height=dp(240),
+            )
+        else:
+            self._start_project_import(folder, target)
+
+    def _start_project_import(self, folder, target):
+        self.set_state("Importing project...")
+        self.file_button.disabled = True
+        self.edit_button.disabled = True
+        self.run_button.disabled = True
+        self.editor.disabled = True
+
+        def report_progress(files, byte_count):
+            # Avoid flooding Kivy's event queue on projects with many small files.
+            if files == 1 or files % 10 == 0:
+                Clock.schedule_once(
+                    partial(self._update_project_import_progress, files, byte_count), 0
+                )
+
+        def worker_main():
+            try:
+                stats = self.storage_bridge.import_project(
+                    destination=target,
+                    record=folder,
+                    progress_callback=report_progress,
+                )
+                Clock.schedule_once(
+                    partial(self._finish_project_import, folder, target, stats, None), 0
+                )
+            except Exception as exc:
+                Clock.schedule_once(
+                    partial(self._finish_project_import, folder, target, None, str(exc)), 0
+                )
+
+        self._project_import_thread = threading.Thread(
+            target=worker_main, name="NovaProjectImport", daemon=True
+        )
+        self._project_import_thread.start()
+
+    def _update_project_import_progress(self, files, byte_count, dt):
+        size_mb = byte_count / (1024.0 * 1024.0)
+        self.set_state("Importing project... %d files · %.1f MB" % (files, size_mb))
+
+    def _finish_project_import(self, folder, target, stats, error, dt):
+        self._project_import_thread = None
+        self.file_button.disabled = False
+        self.edit_button.disabled = False
+        self.run_button.disabled = False
+        self.editor.disabled = False
+        if error:
+            self.set_state("Ready")
+            self.show_message("Project import failed", error)
+            return
+
+        # Remove stale modules from the previous project before switching roots.
+        self.purge_workspace_modules()
+
+        # Switch the editor/file browser to the imported private project copy.
+        self.project_folder = dict(folder)
+        self.active_project_root = target
+        self.workspace = target
+        self._explorer_current_dir = target
+        self.current_path = None
+        self.set_editor_text("")
+        self.set_dirty(False)
+
+        # Open a conventional root entry point when present; otherwise leave a
+        # clean buffer so the user can choose any file from the File menu.
+        entrypoint = os.path.join(target, "main.py")
+        if not os.path.isfile(entrypoint):
+            files = self.list_files()
+            entrypoint = files[0][1] if files else None
+        if entrypoint:
+            self.open_file(entrypoint)
+        else:
+            self.save_session()
+
+        self.set_state("Project ready")
+        self.flash(
+            "Imported %d files (%0.1f MB)" %
+            (stats.get("files", 0), stats.get("bytes", 0) / (1024.0 * 1024.0))
+        )
+
+    def sync_project_folder(self, delete_missing=False):
+        """Synchronize the active private project copy back to Android storage."""
+        if platform != "android":
+            self.show_message(
+                "Android storage",
+                "Project synchronization is available when the IDE runs on Android."
+            )
+            return
+        if self.worker is not None:
+            self.show_message(
+                "Program is running",
+                "Stop the running program before synchronizing the project."
+            )
+            return
+        if (self._project_import_thread is not None
+                and self._project_import_thread.is_alive()):
+            self.flash("Wait for the project import to finish.")
+            return
+        if (self._project_sync_thread is not None
+                and self._project_sync_thread.is_alive()):
+            self.flash("Project synchronization is already running.")
+            return
+
+        folder = self.storage_bridge.get_saved_folder()
+        if not folder:
+            self.show_message("No project folder", "Choose a project folder first.")
+            return
+        if not self.active_project_root or not os.path.isdir(self.active_project_root):
+            self.show_message(
+                "No active project",
+                "Import the selected project before synchronizing it."
+            )
+            return
+        try:
+            expected_root = self.storage_bridge.project_cache_path(record=folder)
+            if os.path.abspath(self.active_project_root) != os.path.abspath(expected_root):
+                self.show_message(
+                    "Different project selected",
+                    "The selected Android folder does not match the active local project. "
+                    "Import the selected folder before syncing."
+                )
+                return
+        except Exception as exc:
+            self.show_message("Project synchronization", str(exc))
+            return
+        if not self.storage_bridge.has_persisted_permission(folder):
+            self.show_message(
+                "Project access expired",
+                "Choose the project folder again to restore Android storage access."
+            )
+            return
+
+        if self.dirty:
+            if delete_missing:
+                message = (
+                    "The editor has unsaved changes. Save them before syncing and "
+                    "deleting removed files?"
+                )
+            else:
+                message = (
+                    "The editor has unsaved changes. Save them before syncing? "
+                    "You can also sync the files already saved in the project copy."
+                )
+            actions = [
+                ("Cancel", None, "neutral"),
+                ("Sync saved files", lambda: self._start_project_sync(
+                    folder, self.active_project_root, delete_missing), "neutral"),
+                ("Save & sync", lambda: self.save_file(then=partial(
+                    self._start_project_sync, folder, self.active_project_root,
+                    delete_missing)), "primary"),
+            ]
+            self.show_dialog("Unsaved changes", message, actions, height=dp(250))
+            return
+
+        self._start_project_sync(folder, self.active_project_root, delete_missing)
+
+    def confirm_project_sync_with_deletions(self):
+        """Ask before deleting source items that no longer exist in the local copy."""
+        self.show_dialog(
+            "Sync and delete removed items?",
+            "This also permanently deletes files and folders in the selected Android "
+            "folder when they are missing from the local project copy. Files added "
+            "outside Nova IDE since the last import may also be removed. This cannot "
+            "be undone.",
+            [
+                ("Cancel", None, "neutral"),
+                ("Continue", lambda: self.sync_project_folder(delete_missing=True), "danger"),
+            ],
+            height=dp(270),
+        )
+
+    def _start_project_sync(self, folder, source_root, delete_missing=False):
+        """Run SAF synchronization off the Kivy UI thread."""
+        if (self._project_sync_thread is not None
+                and self._project_sync_thread.is_alive()):
+            self.flash("Project synchronization is already running.")
+            return
+        self.set_state("Preparing project sync...")
+        self.file_button.disabled = True
+        self.edit_button.disabled = True
+        self.run_button.disabled = True
+        self.editor.disabled = True
+
+        def report_progress(processed, total, relative_path, action, byte_count):
+            if processed == 1 or processed % 5 == 0 or processed == total:
+                Clock.schedule_once(partial(
+                    self._update_project_sync_progress, processed, total,
+                    relative_path, action, byte_count), 0
+                )
+
+        def worker_main():
+            try:
+                stats = self.storage_bridge.sync_project(
+                    source_root=source_root,
+                    record=folder,
+                    delete_missing=delete_missing,
+                    progress_callback=report_progress,
+                )
+                Clock.schedule_once(
+                    partial(self._finish_project_sync, stats, None), 0
+                )
+            except Exception as exc:
+                Clock.schedule_once(
+                    partial(self._finish_project_sync, None, str(exc)), 0
+                )
+
+        self._project_sync_thread = threading.Thread(
+            target=worker_main, name="NovaProjectSync", daemon=True
+        )
+        self._project_sync_thread.start()
+
+    def _update_project_sync_progress(self, processed, total, relative_path,
+                                      action, byte_count, dt):
+        size_mb = byte_count / (1024.0 * 1024.0)
+        self.set_state(
+            "Syncing %d/%d · %s · %.1f MB" %
+            (processed, total, os.path.basename(relative_path), size_mb)
+        )
+
+    def _finish_project_sync(self, stats, error, dt):
+        self._project_sync_thread = None
+        self.file_button.disabled = False
+        self.edit_button.disabled = False
+        self.run_button.disabled = False
+        self.editor.disabled = False
+        if error:
+            self.set_state("Sync incomplete")
+            self.show_message(
+                "Project synchronization failed",
+                error + "\n\nSome earlier files may already have synchronized. "
+                "Run sync again after resolving the problem."
+            )
+            return
+
+        self.set_state("Project synchronized")
+        summary = (
+            "Created: %d\nUpdated: %d\nUnchanged: %d\n" 
+            "Folders created: %d\nDeleted files: %d\nDeleted folders: %d\n" 
+            "Bytes written: %.1f KB"
+        ) % (
+            stats.get("created", 0), stats.get("updated", 0),
+            stats.get("unchanged", 0), stats.get("folders_created", 0),
+            stats.get("deleted_files", 0), stats.get("deleted_folders", 0),
+            stats.get("bytes", 0) / 1024.0,
+        )
+        if stats.get("preserved_remote_only"):
+            summary += (
+                "\n\n%d source-only file(s) were preserved. "
+                "Use the delete-removed-items option only when you intend to remove them."
+                % stats["preserved_remote_only"]
+            )
+        self.show_message("Project synchronized", summary)
+
+    def show_file_menu(self, instance=None):
+        """Show file and project-folder actions without shrinking the editor."""
+        self.editor.focus = False
+        content = BoxLayout(orientation="vertical", padding=dp(12),
+                            spacing=dp(7))
+
+        popup = self.open_popup(
+            "File", content, size_hint=(0.90, None), height=dp(650)
+        )
+
+        folder = self.storage_bridge.get_saved_folder()
+        if folder:
+            has_access = self.storage_bridge.has_persisted_permission(folder)
+            if platform == "android":
+                access_text = "persistent access granted" if has_access else "access needs renewal"
+            else:
+                access_text = "available in Android app"
+            try:
+                selected_cache = self.storage_bridge.project_cache_path(record=folder)
+                is_active = (self.active_project_root is not None
+                             and os.path.abspath(self.active_project_root)
+                             == os.path.abspath(selected_cache))
+            except Exception:
+                is_active = False
+            active_text = ("\nlocal project copy active"
+                           if is_active else "\nnot imported yet")
+            folder_text = "Project folder: %s\n%s%s" % (
+                folder.get("name", "Selected"), access_text, active_text
+            )
+        else:
+            folder_text = "Project folder: not selected"
+        folder_status = make_label(
+            text=folder_text, size=11, color=C_MUTED,
+            size_hint_y=None, height=dp(38),
+        )
+        content.add_widget(folder_status)
+
+        actions = (
+            ("Project explorer", self.open_project_explorer),
+            ("New file", lambda: self.guard_unsaved(self.new_file)),
+            ("Open file", lambda: self.guard_unsaved(self.show_open_dialog)),
+            ("Save", self.save_file),
+            ("Save as", self.show_save_as),
+            ("Choose project folder", self.choose_project_folder),
+            ("Import selected project", self.import_project_folder),
+            ("Sync project to selected folder", self.sync_project_folder),
+            ("Sync + delete removed items", self.confirm_project_sync_with_deletions),
+        )
+        for label, callback in actions:
+            button = FlatButton(
+                text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
+                halign="left", padding=[dp(16), 0],
+            )
+            button.bind(on_release=partial(self._dialog_action, popup, callback))
+            content.add_widget(button)
+
+        close = FlatButton(
+            text="Close", bg=C_BAR, size_hint_y=None, height=dp(42)
+        )
+        close.bind(on_release=lambda *args: popup.dismiss())
+        content.add_widget(close)
+        popup.open()
+
+    def show_edit_menu(self, instance=None):
+        """Open clipboard and selection actions without shrinking the editor."""
+        content = BoxLayout(orientation="vertical", padding=dp(12),
+                            spacing=dp(7))
+        popup = self.open_popup(
+            "Edit", content, size_hint=(0.82, None), height=dp(340)
+        )
+        actions = (
+            ("Select all", self.select_all_text),
+            ("Select word", self.select_word_at_cursor),
+            ("Cut", self.cut_selection),
+            ("Copy", self.copy_selection),
+            ("Paste", self.paste_clipboard),
+        )
+        for label, callback in actions:
+            button = FlatButton(
+                text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
+                halign="left", padding=[dp(16), 0],
+            )
+            button.bind(on_release=partial(self._dialog_action, popup, callback))
+            content.add_widget(button)
+
+        close = FlatButton(
+            text="Close", bg=C_BAR, size_hint_y=None, height=dp(40)
+        )
+        close.bind(on_release=lambda *args: popup.dismiss())
+        content.add_widget(close)
+        popup.open()
+
+    def select_all_text(self):
+        # Kivy can clear selection during a focus update; schedule after the
+        # popup closes so the selection remains visible.
+        Clock.schedule_once(lambda _dt: self.editor.select_all(), 0.05)
+
+    def select_word_at_cursor(self):
+        self.editor.select_word_at_cursor()
+
+    def cut_selection(self):
+        selected = self.editor.selection_text
+        if not selected:
+            self.flash("Select code first, then tap Cut")
+            return
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(selected)
+            self.editor.delete_selection()
+        except Exception as exc:
+            self.flash("Cut failed: %s" % exc)
+
+    def copy_selection(self):
+        selected = self.editor.selection_text
+        if not selected:
+            self.flash("Long-press a word or select code first")
+            return
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(selected)
+        except Exception as exc:
+            self.flash("Copy failed: %s" % exc)
+
+    def paste_clipboard(self):
+        self.editor.paste()
+
     def show_save_as(self, then=None):
         self.editor.focus = False
         content = BoxLayout(orientation="vertical", padding=dp(14),
@@ -1396,6 +1985,419 @@ class PythonIDE(App):
             lambda dt: (setattr(field, "focus", True), field.select_all()), 0.1))
         popup.open()
 
+    # ------------------------------------------------------------------
+    # Project explorer (Stage 6)
+    # ------------------------------------------------------------------
+    def open_project_explorer(self, instance=None):
+        """Open a navigable view of the active private project workspace."""
+        if self.worker is not None:
+            self.flash("Stop the running program before managing project files.")
+            return
+        if ((self._project_import_thread is not None
+             and self._project_import_thread.is_alive())
+                or (self._project_sync_thread is not None
+                    and self._project_sync_thread.is_alive())):
+            self.flash("Wait for project import or synchronization to finish.")
+            return
+        self.show_project_explorer(self._explorer_current_dir or self.workspace)
+
+    def _explorer_root(self):
+        return os.path.realpath(os.path.abspath(self.workspace))
+
+    def _explorer_checked_path(self, path, allow_root=True):
+        path = os.path.realpath(os.path.abspath(path))
+        root = self._explorer_root()
+        if not is_path_inside(root, path, allow_root=allow_root):
+            raise ValueError("That item is outside the active project folder.")
+        return path
+
+    def show_project_explorer(self, directory=None):
+        """Render the current folder; directory navigation stays within workspace."""
+        root = self._explorer_root()
+        try:
+            os.makedirs(root, exist_ok=True)
+            current = self._explorer_checked_path(
+                directory or self._explorer_current_dir or root
+            )
+            if not os.path.isdir(current):
+                current = root
+        except Exception as exc:
+            self.show_message("Project explorer", str(exc))
+            return
+
+        self._explorer_current_dir = current
+        relative = os.path.relpath(current, root)
+        if relative == ".":
+            relative_label = "/"
+        else:
+            relative_label = "/" + relative.replace(os.sep, "/")
+
+        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(7))
+        path_label = make_label(
+            "PROJECT  " + escape_markup(relative_label), size=12,
+            color=C_ACCENT, size_hint_y=None, height=dp(30),
+            markup=True,
+        )
+        content.add_widget(path_label)
+
+        toolbar = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(5))
+        parent = os.path.dirname(current)
+        up_button = FlatButton(
+            text="UP", bg=C_BTN, size_hint_x=None, width=dp(58),
+            disabled=(current == root),
+        )
+        up_button.bind(on_release=lambda *_: self.show_project_explorer(parent))
+        folder_button = FlatButton(text="+ FOLDER", bg=C_BTN)
+        folder_button.bind(
+            on_release=lambda *_: self._prompt_explorer_name(
+                "New folder", "", partial(self._create_explorer_folder, current),
+                "Folder name", return_directory=current,
+            )
+        )
+        file_button = FlatButton(text="+ PY FILE", bg=C_BTN)
+        file_button.bind(on_release=lambda *_: self._begin_explorer_new_file(current))
+        refresh_button = FlatButton(
+            text="↻", bg=C_BTN, size_hint_x=None, width=dp(48)
+        )
+        refresh_button.bind(on_release=lambda *_: self.show_project_explorer(current))
+        for button in (up_button, folder_button, file_button, refresh_button):
+            toolbar.add_widget(button)
+        content.add_widget(toolbar)
+
+        note = make_label(
+            "Local copy · normal Sync adds/updates; Sync + delete mirrors renames/deletions",
+            size=10, color=C_MUTED, size_hint_y=None, height=dp(30),
+        )
+        content.add_widget(note)
+
+        scroll = ScrollView(do_scroll_x=False, do_scroll_y=True,
+                            bar_width=dp(4), scroll_type=["bars", "content"])
+        entries_box = BoxLayout(
+            orientation="vertical", size_hint_y=None, spacing=dp(3),
+            padding=[0, dp(2), 0, dp(4)],
+        )
+        entries_box.bind(minimum_height=entries_box.setter("height"))
+
+        entries = []
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    # Do not follow symlinks: they may point outside the project
+                    # or create directory cycles in the explorer.
+                    if entry.is_symlink():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            entries.append((0, entry.name, entry.path, 0, 0))
+                        elif entry.is_file(follow_symlinks=False):
+                            stat = entry.stat(follow_symlinks=False)
+                            entries.append((1, entry.name, entry.path,
+                                            stat.st_size, stat.st_mtime))
+                    except OSError:
+                        continue
+        except OSError as exc:
+            self.show_message("Could not read folder", str(exc))
+            return
+
+        entries.sort(key=lambda item: (item[0], item[1].casefold()))
+        if not entries:
+            entries_box.add_widget(make_label(
+                "This folder is empty.\nCreate a folder or Python file to get started.",
+                size=13, color=C_MUTED, halign="center", size_hint_y=None,
+                height=dp(100),
+            ))
+        else:
+            for kind, name, path, size, mtime in entries:
+                entries_box.add_widget(self.make_explorer_row(
+                    kind, name, path, size, mtime, current
+                ))
+        scroll.add_widget(entries_box)
+        content.add_widget(scroll)
+
+        close = FlatButton(
+            text="Close", bg=C_BAR, size_hint_y=None, height=dp(42)
+        )
+        content.add_widget(close)
+        title = "Project Explorer"
+        if self.active_project_root:
+            title += " · " + os.path.basename(root)
+        popup = self.open_popup(title, content, size_hint=(0.97, 0.88))
+        close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+        return popup
+
+    def make_explorer_row(self, kind, name, path, size, mtime, current_dir):
+        row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(4))
+        if kind == 0:
+            title = "▸  " + escape_markup(name)
+            detail = "Folder"
+        else:
+            title = "    " + escape_markup(name)
+            extension = os.path.splitext(name)[1].lower() or "File"
+            detail = "%s · %s" % (format_size(size), extension)
+        label = "%s\n[size=%d][color=8b93b5]%s[/color][/size]" % (
+            title, int(sp(10)), escape_markup(detail)
+        )
+        open_button = FlatButton(
+            text=label, bg=C_BTN, markup=True, halign="left",
+            valign="middle", font_size=sp(13),
+        )
+        open_button.bind(
+            size=lambda widget, value: setattr(
+                widget, "text_size", (max(0, value[0] - dp(16)), value[1])
+            )
+        )
+        if kind == 0:
+            open_button.bind(
+                on_release=partial(self._explorer_open_directory, path)
+            )
+        else:
+            open_button.bind(on_release=partial(self._explorer_open_file, path))
+
+        rename_button = FlatButton(
+            text="REN", bg=C_BTN, size_hint_x=None, width=dp(48),
+            font_size=sp(10),
+        )
+        rename_button.bind(on_release=partial(self._explorer_rename_item, path))
+        delete_button = FlatButton(
+            text="DEL", bg=C_BTN, fg=_c("#ff7b72"),
+            size_hint_x=None, width=dp(48), font_size=sp(10),
+        )
+        delete_button.bind(on_release=partial(self._explorer_confirm_delete, path))
+        row.add_widget(open_button)
+        row.add_widget(rename_button)
+        row.add_widget(delete_button)
+        return row
+
+    def _explorer_open_directory(self, path, instance=None):
+        try:
+            path = self._explorer_checked_path(path)
+            if not os.path.isdir(path):
+                raise ValueError("This folder no longer exists.")
+        except Exception as exc:
+            self.show_message("Project explorer", str(exc))
+            return
+        self.show_project_explorer(path)
+
+    def _explorer_open_file(self, path, instance=None):
+        try:
+            path = self._explorer_checked_path(path, allow_root=False)
+            if not os.path.isfile(path):
+                raise ValueError("This file no longer exists.")
+        except Exception as exc:
+            self.show_message("Project explorer", str(exc))
+            return
+        if os.path.splitext(path)[1].lower() != ".py":
+            relative = os.path.relpath(path, self._explorer_root()).replace(os.sep, "/")
+            self.flash("Asset file: use the relative path %s" % relative, seconds=4)
+            return
+        self.close_popup()
+        if path == self.current_path and not self.dirty:
+            return
+        self.guard_unsaved(lambda: self.open_file(path))
+
+    def _prompt_explorer_name(self, title, initial, callback, hint,
+                              return_directory=None):
+        content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        field = TextInput(
+            text=initial, hint_text=hint, multiline=False, font_size=sp(15),
+            size_hint_y=None, height=dp(46), write_tab=False,
+        )
+        self.style_input(field)
+        error = make_label(
+            "", size=11, color=C_STOP, size_hint_y=None, height=dp(28),
+        )
+        actions = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        cancel = FlatButton(text="Cancel", bg=C_BTN)
+        save = FlatButton(
+            text=("Apply" if title.lower().startswith("rename") else "Create"),
+            bg=C_PRIMARY,
+        )
+        actions.add_widget(cancel)
+        actions.add_widget(save)
+        content.add_widget(field)
+        content.add_widget(error)
+        content.add_widget(actions)
+        popup = self.open_popup(title, content, size_hint=(0.90, None), height=dp(205))
+
+        def submit(*_args):
+            try:
+                name = clean_explorer_name(field.text)
+            except ValueError as exc:
+                error.text = str(exc)
+                return
+            popup.dismiss()
+            Clock.schedule_once(lambda _dt: callback(name), 0)
+
+        def cancel_prompt(*_args):
+            popup.dismiss()
+            if return_directory is not None:
+                Clock.schedule_once(
+                    lambda _dt: self.show_project_explorer(return_directory), 0
+                )
+
+        cancel.bind(on_release=cancel_prompt)
+        save.bind(on_release=submit)
+        field.bind(on_text_validate=submit)
+        popup.bind(on_open=lambda *_: Clock.schedule_once(
+            lambda _dt: setattr(field, "focus", True), 0.1
+        ))
+        popup.open()
+
+    def _create_explorer_folder(self, name, parent):
+        try:
+            parent = self._explorer_checked_path(parent)
+            target = os.path.join(parent, name)
+            if not is_path_inside(self._explorer_root(), target, allow_root=False):
+                raise ValueError("Invalid folder location.")
+            if os.path.lexists(target):
+                raise FileExistsError("An item with that name already exists.")
+            os.mkdir(target)
+        except Exception as exc:
+            self.show_message("Could not create folder", str(exc))
+            return
+        self.flash("Created folder %s" % name)
+        self.show_project_explorer(parent)
+
+    def _begin_explorer_new_file(self, parent):
+        if self.dirty:
+            self.guard_unsaved(lambda: self._prompt_explorer_new_file(parent))
+        else:
+            self._prompt_explorer_new_file(parent)
+
+    def _prompt_explorer_new_file(self, parent):
+        self._prompt_explorer_name(
+            "New Python file", "", partial(self._create_explorer_file, parent),
+            "example.py", return_directory=parent,
+        )
+
+    def _create_explorer_file(self, name, parent):
+        try:
+            filename = clean_filename(name)
+            parent = self._explorer_checked_path(parent)
+            target = os.path.join(parent, filename)
+            if not is_path_inside(self._explorer_root(), target, allow_root=False):
+                raise ValueError("Invalid file location.")
+            with open(target, "x", encoding="utf-8", newline="\n"):
+                pass
+        except FileExistsError:
+            self.show_message("File already exists", "Choose a different filename.")
+            return
+        except Exception as exc:
+            self.show_message("Could not create file", str(exc))
+            return
+        self.close_popup()
+        self.current_path = target
+        self.set_editor_text("")
+        self.set_dirty(False)
+        self.save_session()
+        self.flash("Created %s" % filename)
+
+    def _explorer_rename_item(self, path, instance=None):
+        try:
+            path = self._explorer_checked_path(path, allow_root=False)
+            if not os.path.lexists(path):
+                raise FileNotFoundError("This item no longer exists.")
+        except Exception as exc:
+            self.show_message("Could not rename item", str(exc))
+            return
+        parent = os.path.dirname(path)
+        old_name = os.path.basename(path)
+        self._prompt_explorer_name(
+            "Rename item", old_name,
+            partial(self._rename_explorer_item, path, parent),
+            "New name", return_directory=self._explorer_current_dir,
+        )
+
+    def _rename_explorer_item(self, old_path, parent, new_name):
+        try:
+            old_path = self._explorer_checked_path(old_path, allow_root=False)
+            parent = self._explorer_checked_path(parent)
+            new_name = clean_explorer_name(new_name)
+            new_path = os.path.join(parent, new_name)
+            if not is_path_inside(self._explorer_root(), new_path, allow_root=False):
+                raise ValueError("Invalid destination.")
+            if not os.path.lexists(old_path):
+                raise FileNotFoundError("The original item no longer exists.")
+            if os.path.abspath(old_path) == os.path.abspath(new_path):
+                self.show_project_explorer(parent)
+                return
+            if os.path.lexists(new_path):
+                raise FileExistsError("An item with that name already exists.")
+            os.rename(old_path, new_path)
+
+            # Keep an open editor buffer attached to its renamed file or folder.
+            if self.current_path and is_path_inside(old_path, self.current_path):
+                relative_file = os.path.relpath(self.current_path, old_path)
+                self.current_path = (new_path if relative_file == "."
+                                     else os.path.join(new_path, relative_file))
+                self.update_tab()
+                self.save_session()
+
+            # Preserve the explorer location when a containing folder is renamed.
+            old_dir = self._explorer_current_dir
+            if is_path_inside(old_path, old_dir):
+                relative_dir = os.path.relpath(old_dir, old_path)
+                self._explorer_current_dir = (
+                    new_path if relative_dir == "."
+                    else os.path.join(new_path, relative_dir)
+                )
+            else:
+                self._explorer_current_dir = parent
+        except Exception as exc:
+            self.show_message("Could not rename item", str(exc))
+            return
+        self.flash("Renamed to %s" % new_name)
+        self.show_project_explorer(self._explorer_current_dir)
+
+    def _explorer_confirm_delete(self, path, instance=None):
+        try:
+            path = self._explorer_checked_path(path, allow_root=False)
+            if not os.path.lexists(path):
+                raise FileNotFoundError("This item no longer exists.")
+        except Exception as exc:
+            self.show_message("Could not delete item", str(exc))
+            return
+        name = os.path.basename(path)
+        is_folder = os.path.isdir(path) and not os.path.islink(path)
+        item_kind = "folder and all its contents" if is_folder else "file"
+        self.show_dialog(
+            "Delete project item?",
+            "Delete %s '%s' from the local project copy? This cannot be undone. "
+            "The original Android folder is changed only after using Sync + delete removed items." %
+            (item_kind, name),
+            [
+                ("Cancel", lambda: self.show_project_explorer(
+                    self._explorer_current_dir), "neutral"),
+                ("Delete", lambda: self._delete_explorer_item(path), "danger"),
+            ],
+            height=dp(255),
+        )
+
+    def _delete_explorer_item(self, path):
+        try:
+            path = self._explorer_checked_path(path, allow_root=False)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+
+            # Preserve unsaved text in memory, but detach it from the removed file.
+            if self.current_path and is_path_inside(path, self.current_path):
+                self.current_path = None
+                self.set_dirty(True)
+                self.save_session()
+
+            current_dir = self._explorer_current_dir
+            if is_path_inside(path, current_dir):
+                current_dir = os.path.dirname(path)
+            self._explorer_current_dir = current_dir
+        except Exception as exc:
+            self.show_message("Could not delete item", str(exc))
+            return
+        self.flash("Deleted %s" % os.path.basename(path))
+        self.show_project_explorer(self._explorer_current_dir)
+
     def show_open_dialog(self):
         self.editor.focus = False
         files = self.list_files()
@@ -1407,7 +2409,7 @@ class PythonIDE(App):
 
         if not files:
             content.add_widget(make_label(
-                "No saved files yet.\nWrite some code and tap SAVE.",
+                "No saved files yet.\nWrite some code and choose File → Save.",
                 size=14, color=C_MUTED, halign="center"))
         else:
             scroll = ScrollView(do_scroll_x=False, bar_width=dp(4))
@@ -1584,9 +2586,8 @@ class PythonIDE(App):
         elif symbol == "PASTE":
             editor.paste()
         elif symbol in PAIRS:
-            # Let SmartCodeInput apply the same quote-context rules used by
-            # physical keyboard input (and pair brackets consistently).
-            editor.insert_text(symbol)
+            editor.insert_text(symbol + PAIRS[symbol])
+            editor.do_cursor_movement("cursor_left")
         else:
             editor.insert_text(symbol)
         editor.focus = True
@@ -1630,18 +2631,24 @@ class PythonIDE(App):
         self.show_bar(self.suggest_box)
 
     def apply_completion(self, completion, instance):
-        text = self.editor.text
-        index = self.editor.cursor_index()
-        before = text[:index]
+        editor = self.editor
+        # A completion should only replace the identifier immediately before
+        # the cursor; don't disturb a user's active selection.
+        if editor.selection_text:
+            return
+
+        index = editor.cursor_index()
+        before = editor.text[:index]
         match = re.search(r"[A-Za-z_]\w*$", before)
         if not match:
             return
 
-        new_text = text[:match.start()] + completion + text[index:]
-        new_index = match.start() + len(completion)
-        self.editor.text = new_text
-        self.editor.cursor = self.editor.get_cursor_from_index(new_index)
-        self.editor.focus = True
+        # Use normal backspace/insert operations so TextInput's undo stack,
+        # syntax highlighting and change bindings remain in sync.
+        for _ in match.group(0):
+            editor.do_backspace()
+        editor.insert_text(completion)
+        editor.focus = True
 
     # ------------------------------------------------------------------
     # Running and stopping code
@@ -1649,6 +2656,14 @@ class PythonIDE(App):
     def run_code(self, instance):
         if self.worker is not None:
             self.flash("A program is already running.")
+            return
+        if (self._project_import_thread is not None
+                and self._project_import_thread.is_alive()):
+            self.flash("Wait for the project import to finish.")
+            return
+        if (self._project_sync_thread is not None
+                and self._project_sync_thread.is_alive()):
+            self.flash("Wait for project synchronization to finish.")
             return
 
         code = self.editor.text
@@ -1670,7 +2685,10 @@ class PythonIDE(App):
                 break
 
         name = self.current_name()
-        file_path = self.current_path or os.path.join(self.workspace, name)
+        run_root = os.path.abspath(self.workspace)
+        file_path = os.path.abspath(
+            self.current_path or os.path.join(run_root, name)
+        )
 
         self.stop_requested = False
         self.run_button.disabled = True
@@ -1681,7 +2699,9 @@ class PythonIDE(App):
         self.fd_capture.start()
 
         thread = threading.Thread(
-            target=self.execute_code, args=(code, name, file_path), daemon=True
+            target=self.execute_code,
+            args=(code, name, file_path, run_root),
+            daemon=True,
         )
         self.worker = thread
         thread.start()
@@ -1734,14 +2754,26 @@ class PythonIDE(App):
         run_builtins["input"] = self.request_input
         return run_builtins
 
-    def execute_code(self, code, name, file_path):
+    def execute_code(self, code, name, file_path, run_root=None):
         me = threading.current_thread()
         started = time.perf_counter()
+        previous_cwd = os.getcwd()
+        previous_sys_path = list(sys.path)
+        run_root = os.path.abspath(run_root or os.path.dirname(file_path) or self.workspace)
+        script_dir = os.path.abspath(os.path.dirname(file_path) or run_root)
 
-        # Lets tracebacks show the real source lines of the editor's code.
-        linecache.cache[name] = (len(code), None, code.splitlines(True), name)
-
+        # Give user code normal project-relative file access and imports. This
+        # makes open("data.json"), pygame.image.load("assets/a.png"), and
+        # sibling module imports resolve from the imported project mirror.
         try:
+            os.chdir(run_root)
+            if script_dir != run_root:
+                sys.path.insert(0, script_dir)
+            sys.path.insert(0, run_root)
+
+            # Lets tracebacks show the real source lines of the editor's code.
+            linecache.cache[name] = (len(code), None, code.splitlines(True), name)
+
             compiled = compile(code, name, "exec")
             exec(compiled, {
                 "__name__": "__main__",
@@ -1763,6 +2795,13 @@ class PythonIDE(App):
                 "\n" + "".join(traceback.format_exception(type(exc), exc, tb))
             )
         finally:
+            # cwd is process-global, so always restore it before the next IDE
+            # action/run. Restore sys.path too, even if user code changed it.
+            try:
+                os.chdir(previous_cwd)
+            except OSError:
+                pass
+            sys.path[:] = previous_sys_path
             try:
                 elapsed = time.perf_counter() - started
                 self.append_output(f"\nFinished in {elapsed:.3f} seconds.\n")
