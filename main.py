@@ -19,7 +19,8 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import Color, Rectangle, Triangle
+from kivy.graphics import Color, Line, Rectangle, Triangle
+from kivy.graphics.instructions import InstructionGroup
 from kivy.metrics import dp, sp
 from kivy.resources import resource_find
 from kivy.uix.boxlayout import BoxLayout
@@ -701,6 +702,111 @@ class SmartCodeInput(CodeInput):
         return True
 
 
+class IndentationGuides:
+    """Draw subtle vertical guides for active Python indentation blocks.
+
+    Guides are attached to the editor area's background canvas, so they sit
+    behind the text and never intercept touch input. Their positions follow
+    the editor's horizontal and vertical scroll offsets.
+    """
+
+    def __init__(self, editor, backdrop):
+        self.editor = editor
+        self.group = InstructionGroup()
+        backdrop.canvas.before.add(self.group)
+        self._trigger = Clock.create_trigger(self.redraw, 0)
+        editor.bind(
+            text=self.schedule,
+            scroll_x=self.schedule,
+            scroll_y=self.schedule,
+            pos=self.schedule,
+            size=self.schedule,
+            padding=self.schedule,
+            font_size=self.schedule,
+            font_name=self.schedule,
+            tab_width=self.schedule,
+        )
+        self.schedule()
+
+    def schedule(self, *args):
+        self._trigger()
+
+    @staticmethod
+    def _indent_columns(line, tab_width):
+        columns = 0
+        for char in line:
+            if char == " ":
+                columns += 1
+            elif char == "\t":
+                columns += tab_width - (columns % tab_width)
+            else:
+                break
+        return columns
+
+    def redraw(self, *args):
+        ed = self.editor
+        self.group.clear()
+        self.group.add(Color(C_MUTED[0], C_MUTED[1], C_MUTED[2], 0.30))
+
+        dy = ed.line_height + ed.line_spacing
+        if dy <= 0 or ed.width <= 0 or ed.height <= 0:
+            return
+
+        tab_width = max(1, int(getattr(ed, "tab_width", 4) or 4))
+        source_lines = ed.text.split("\n")
+        indents = [self._indent_columns(line, tab_width)
+                   for line in source_lines]
+        max_indent = max(indents, default=0)
+        if max_indent < tab_width:
+            return
+
+        char_width = getattr(ed, "ide_char_w", 0)
+        if not char_width:
+            return
+
+        pad_left, pad_top = ed.padding[0], ed.padding[1]
+        top0 = ed.top - pad_top + ed.scroll_y
+        visible_top, visible_bottom = ed.top, ed.y
+
+        # Draw a guide only across runs belonging to an indented block.
+        for level in range(tab_width, max_indent + 1, tab_width):
+            active = [indent >= level for indent in indents]
+
+            # Keep guides continuous across blank lines inside a block. Build
+            # nearest nonblank neighbours in linear time for large source files.
+            previous_active = [False] * len(source_lines)
+            following_active = [False] * len(source_lines)
+            nearest = False
+            for index, line in enumerate(source_lines):
+                previous_active[index] = nearest
+                if line.strip():
+                    nearest = indents[index] >= level
+            nearest = False
+            for index in range(len(source_lines) - 1, -1, -1):
+                following_active[index] = nearest
+                if source_lines[index].strip():
+                    nearest = indents[index] >= level
+            for index, line in enumerate(source_lines):
+                if not line.strip():
+                    active[index] = previous_active[index] and following_active[index]
+
+            start = None
+            for row, is_active in enumerate(active + [False]):
+                if is_active and start is None:
+                    start = row
+                elif not is_active and start is not None:
+                    x = ed.x + pad_left + level * char_width - ed.scroll_x
+                    if ed.x <= x <= ed.right:
+                        y_top = min(visible_top, top0 - start * dy)
+                        y_bottom = max(visible_bottom, top0 - row * dy)
+                        if y_top > y_bottom:
+                            self.group.add(Line(
+                                points=(x, y_bottom, x, y_top),
+                                width=dp(1),
+                            ))
+                    start = None
+
+
 class LineNumberGutter(StencilView):
     """Line numbers drawn next to a SmartCodeInput.
 
@@ -1019,6 +1125,7 @@ class PythonIDE(App):
             **extra,
         )
 
+        self.indent_guides = IndentationGuides(self.editor, area)
         self.gutter = LineNumberGutter(self.editor, area)
         area.add_widget(self.gutter)
         area.add_widget(self.editor)
