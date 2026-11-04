@@ -988,6 +988,8 @@ class PythonIDE(App):
 
         self.current_path = None
         self.dirty = False
+        self.open_documents = []
+        self.active_document = None
         self.popup = None
         self._loading = False
         self._autosave_event = None
@@ -999,6 +1001,8 @@ class PythonIDE(App):
         self.kb_height = 0
         self._full_height = Window.height
         self._ime_works = False
+        self._android_file_picker_bound = False
+        self._android_file_picker_request = 4107
 
         # Route print()/stderr from the running program to the console.
         self._orig_stdout = sys.stdout
@@ -1012,10 +1016,12 @@ class PythonIDE(App):
 
         root.add_widget(self.build_app_bar())
         root.add_widget(divider())
-        root.add_widget(self.build_symbol_bar())
+        root.add_widget(self.build_file_tabs())
         root.add_widget(self.build_editor_area())
         root.add_widget(self.build_console())
         root.add_widget(self.build_status_bar())
+        # Keep the custom coding keys immediately above the Android keyboard.
+        root.add_widget(self.build_symbol_bar())
 
         Window.bind(on_keyboard=self.on_keyboard, on_key_down=self.on_key_down)
         Clock.schedule_interval(self.poll_keyboard, 0.2)
@@ -1026,40 +1032,59 @@ class PythonIDE(App):
                          cursor=self.update_suggestions)
 
         self.load_session()
+        if not self.open_documents:
+            document = self._new_document(
+                self.current_path, self.editor.text, self.dirty
+            )
+            self.open_documents.append(document)
+            self.active_document = document
+            self._capture_active_document()
         self.update_tab()
         self.update_cursor()
         Clock.schedule_once(self.update_suggestions, 0)
         return root
 
     def build_app_bar(self):
-        bar = BoxLayout(size_hint_y=None, height=dp(48),
-                        padding=[dp(12), dp(6), dp(8), dp(6)], spacing=dp(8))
+        # A slimmer toolbar leaves more vertical room for the code editor.
+        bar = BoxLayout(size_hint_y=None, height=dp(40),
+                        padding=[dp(8), dp(3), dp(6), dp(3)], spacing=dp(6))
         paint(bar, C_BAR)
 
-        self.tab_label = make_label(size=14, markup=True, bold=True)
+        self.tab_label = make_label(size=13, markup=True, bold=True)
         bar.add_widget(self.tab_label)
 
         self.file_button = FlatButton(
-            text="FILE", bg=C_BTN, size_hint_x=None, width=dp(54),
-            font_size=sp(12),
+            text="FILE", bg=C_BTN, size_hint_x=None, width=dp(50),
+            font_size=sp(11),
         )
         self.file_button.bind(on_release=self.show_file_menu)
-        self.edit_button = FlatButton(
-            text="EDIT", bg=C_BTN, size_hint_x=None, width=dp(54),
-            font_size=sp(12),
-        )
-        self.edit_button.bind(on_release=self.show_edit_menu)
         self.run_button = IconButton("play", bg=C_RUN, size_hint_x=None,
-                                     width=dp(56))
+                                     width=dp(48))
         self.run_button.bind(on_release=self.run_code)
         self.stop_button = IconButton("stop", bg=C_STOP, size_hint_x=None,
-                                      width=dp(56), disabled=True)
+                                      width=dp(48), disabled=True)
         self.stop_button.bind(on_release=self.stop_code)
         bar.add_widget(self.file_button)
-        bar.add_widget(self.edit_button)
         bar.add_widget(self.run_button)
         bar.add_widget(self.stop_button)
         return bar
+
+    def build_file_tabs(self):
+        """Horizontal strip showing every file currently open in the editor."""
+        self.file_tabs_scroll = ScrollView(
+            size_hint_y=None, height=dp(32), do_scroll_x=True,
+            do_scroll_y=False, bar_width=0, scroll_type=["content"],
+        )
+        paint(self.file_tabs_scroll, C_BAR)
+        self.file_tabs_box = BoxLayout(
+            size_hint=(None, 1), spacing=dp(3),
+            padding=[dp(6), dp(2), dp(6), dp(2)],
+        )
+        self.file_tabs_box.bind(
+            minimum_width=self.file_tabs_box.setter("width")
+        )
+        self.file_tabs_scroll.add_widget(self.file_tabs_box)
+        return self.file_tabs_scroll
 
     def build_symbol_bar(self):
         self.bar_scroll = ScrollView(
@@ -1196,17 +1221,15 @@ class PythonIDE(App):
         return self.console
 
     def build_status_bar(self):
-        bar = BoxLayout(size_hint_y=None, height=dp(24),
+        bar = BoxLayout(size_hint_y=None, height=dp(22),
                         padding=[dp(10), 0], spacing=dp(10))
         paint(bar, C_STATUS)
 
-        self.pos_label = make_label("Ln 1, Col 1", size=11, size_hint_x=None,
-                                    width=dp(100))
+        # Cursor line/column is intentionally omitted from the phone layout.
         self.state_label = make_label("Ready", size=11)
         info = f"Python {sys.version_info.major}.{sys.version_info.minor} \u00b7 UTF-8"
         info_label = make_label(info, size=11, halign="right", size_hint_x=None,
                                 width=dp(120))
-        bar.add_widget(self.pos_label)
         bar.add_widget(self.state_label)
         bar.add_widget(info_label)
         return bar
@@ -1237,6 +1260,15 @@ class PythonIDE(App):
         self.stop_capture()
         if getattr(self, "storage_bridge", None) is not None:
             self.storage_bridge.unbind()
+        if getattr(self, "_android_file_picker_bound", False):
+            try:
+                from jnius import autoclass
+                autoclass("org.kivy.android.PythonActivity").mActivity.unbind(
+                    on_activity_result=self._on_android_file_result
+                )
+            except Exception:
+                pass
+            self._android_file_picker_bound = False
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         raise_in_thread(self.worker, StopRun)
@@ -1255,7 +1287,7 @@ class PythonIDE(App):
         if self.editor.focus:
             self.editor.focus = False
             return True
-        if self.dirty:
+        if self.has_unsaved_documents():
             self.guard_unsaved(self.exit_app)
             return True
         return False
@@ -1267,9 +1299,9 @@ class PythonIDE(App):
         if letter == "s":
             self.save_file()
         elif letter == "o":
-            self.guard_unsaved(self.show_open_dialog)
+            self.show_open_dialog()
         elif letter == "n":
-            self.guard_unsaved(self.new_file)
+            self.new_file()
         elif letter == "r":
             self.run_code(None)
         elif letter == "a":
@@ -1318,12 +1350,21 @@ class PythonIDE(App):
     def set_console_visible(self, visible):
         parent = self.console.parent
         if visible and parent is None:
-            self.root_layout.add_widget(self.console, index=1)  # above status bar
+            # Reinsert above status + custom keys, keeping the symbol bar at bottom.
+            self.root_layout.add_widget(self.console, index=2)
         elif not visible and parent is not None:
             parent.remove_widget(self.console)
 
     def exit_app(self):
+        # A deliberate Discard removes only dirty buffers from the saved session.
+        self.open_documents = [
+            document for document in self.open_documents
+            if not document.get("dirty")
+        ]
+        self.active_document = None
+        self.current_path = None
         self.dirty = False
+        self.save_session()
         self.stop()
 
     # ------------------------------------------------------------------
@@ -1344,22 +1385,97 @@ class PythonIDE(App):
         self._status_event = None
         self.state_label.text = self.state_text
 
+    def _new_document(self, path=None, text="", dirty=False, name=None):
+        """Create an editor-buffer record without changing the visible editor."""
+        if path:
+            path = os.path.abspath(path)
+            name = os.path.basename(path)
+        elif not name:
+            used = {doc.get("name") for doc in self.open_documents}
+            name = "untitled.py"
+            number = 2
+            while name in used:
+                name = "untitled%d.py" % number
+                number += 1
+        return {
+            "path": path,
+            "name": name or "untitled.py",
+            "text": text if isinstance(text, str) else "",
+            "dirty": bool(dirty),
+            "cursor": (0, 0),
+            "scroll_x": 0,
+            "scroll_y": 0,
+        }
+
+    def _capture_active_document(self):
+        """Copy the live editor state into the active tab's buffer record."""
+        document = self.active_document
+        if document is None or not hasattr(self, "editor"):
+            return
+        document["path"] = self.current_path
+        document["name"] = (
+            os.path.basename(self.current_path)
+            if self.current_path else document.get("name", "untitled.py")
+        )
+        document["text"] = self.editor.text
+        document["dirty"] = bool(self.dirty)
+        try:
+            document["cursor"] = tuple(self.editor.cursor)
+            document["scroll_x"] = float(self.editor.scroll_x)
+            document["scroll_y"] = float(self.editor.scroll_y)
+        except Exception:
+            pass
+
     def current_name(self):
         if self.current_path:
             return os.path.basename(self.current_path)
+        if self.active_document is not None:
+            return self.active_document.get("name", "untitled.py")
         return "untitled.py"
+
+    def refresh_file_tabs(self):
+        box = getattr(self, "file_tabs_box", None)
+        if box is None:
+            return
+        box.clear_widgets()
+        for document in self.open_documents:
+            name = document.get("name") or "untitled.py"
+            marker = "  •" if document.get("dirty") else ""
+            active = document is self.active_document
+            width = dp(min(190, max(76, len(name) * 7 + 24)))
+            button = FlatButton(
+                text=name + marker,
+                bg=C_PRIMARY if active else C_BTN,
+                size_hint=(None, 1), width=width,
+                font_size=sp(11),
+            )
+            button.bind(on_release=partial(self.activate_document, document))
+            box.add_widget(button)
+        if self.active_document is not None:
+            Clock.schedule_once(
+                lambda _dt: setattr(self.file_tabs_scroll, "scroll_x", 1), 0
+            )
 
     def update_tab(self):
         dot = DIRTY_DOT if self.dirty else ""
         self.tab_label.text = dot + escape_markup(self.current_name())
         self.file_button.color = C_ACCENT if self.dirty else C_TEXT
+        self.refresh_file_tabs()
 
     def update_cursor(self, *args):
-        col, row = self.editor.cursor
-        self.pos_label.text = f"Ln {row + 1}, Col {col + 1}"
+        # Keep the cursor location with its document so tab switching restores it.
+        if self.active_document is not None:
+            try:
+                self.active_document["cursor"] = tuple(self.editor.cursor)
+                self.active_document["scroll_x"] = float(self.editor.scroll_x)
+                self.active_document["scroll_y"] = float(self.editor.scroll_y)
+            except Exception:
+                pass
 
     def set_dirty(self, flag):
-        self.dirty = flag
+        self.dirty = bool(flag)
+        if self.active_document is not None:
+            self.active_document["dirty"] = self.dirty
         self.update_tab()
 
     # ------------------------------------------------------------------
@@ -1368,6 +1484,8 @@ class PythonIDE(App):
     def on_editor_text(self, editor, value):
         if self._loading:
             return
+        if self.active_document is not None:
+            self.active_document["text"] = value
         if not self.dirty:
             self.set_dirty(True)
         # Debounced draft save so an Android kill doesn't lose work.
@@ -1389,24 +1507,75 @@ class PythonIDE(App):
         except Exception:
             pass
 
+    def activate_document(self, document, instance=None, persist=True):
+        """Switch to an already-open file while preserving every buffer."""
+        if not any(item is document for item in self.open_documents):
+            return
+        if document is self.active_document:
+            return
+
+        self._capture_active_document()
+        was_focused = bool(self.editor.focus)
+        self.active_document = document
+        self.current_path = document.get("path")
+        self.dirty = bool(document.get("dirty"))
+        # set_editor_text resets cursor/scroll and emits cursor bindings, so
+        # capture the saved view position before replacing the visible buffer.
+        saved_cursor = tuple(document.get("cursor", (0, 0)))
+        saved_scroll_x = float(document.get("scroll_x", 0))
+        saved_scroll_y = float(document.get("scroll_y", 0))
+        self.set_editor_text(document.get("text", ""))
+        try:
+            self.editor.cursor = saved_cursor
+            self.editor.scroll_x = saved_scroll_x
+            self.editor.scroll_y = saved_scroll_y
+        except Exception:
+            self.editor.cursor = (0, 0)
+        self.update_tab()
+        self.update_suggestions()
+        if was_focused:
+            self.editor.focus = True
+        if persist:
+            self.save_session()
+
     def new_file(self):
-        self.set_editor_text("")
-        self.current_path = None
-        self.set_dirty(False)
+        document = self._new_document(text="", dirty=False)
+        self.open_documents.append(document)
+        self.activate_document(document)
         self.editor.focus = True
         self.flash("New file")
 
     def open_file(self, path):
+        path = os.path.abspath(path)
+        for document in self.open_documents:
+            if document.get("path") and os.path.abspath(document["path"]) == path:
+                self.activate_document(document)
+                self.flash(f"Switched to {os.path.basename(path)}")
+                return
         try:
             text = read_text_file(path)
         except Exception as exc:
             self.show_message("Could not open file", str(exc))
             return
-        self.set_editor_text(text)
-        self.current_path = path
-        self.set_dirty(False)
+        document = self._new_document(path=path, text=text, dirty=False)
+        self.open_documents.append(document)
+        self.activate_document(document)
         self.save_session()
         self.flash(f"Opened {os.path.basename(path)}")
+
+    def _reset_documents(self, text="", create=True):
+        """Discard the old workspace's open-tab list and start a fresh one."""
+        self.open_documents = []
+        self.active_document = None
+        self.current_path = None
+        self.dirty = False
+        self.set_editor_text(text)
+        if create:
+            document = self._new_document(text=text, dirty=False)
+            self.open_documents.append(document)
+            self.active_document = document
+        self.update_tab()
+        self.save_session()
 
     def save_file(self, then=None):
         if not self.current_path:
@@ -1415,12 +1584,25 @@ class PythonIDE(App):
         self.write_current(self.current_path, then)
 
     def write_current(self, path, then=None):
+        path = os.path.abspath(path)
+        for document in self.open_documents:
+            if (document is not self.active_document and document.get("path")
+                    and os.path.abspath(document["path"]) == path):
+                self.show_message(
+                    "File already open",
+                    "That file is already open in another tab. Switch to that tab to edit it.",
+                )
+                return
         try:
             write_text_file(path, self.editor.text)
         except Exception as exc:
             self.show_message("Could not save file", str(exc))
             return
         self.current_path = path
+        if self.active_document is not None:
+            self.active_document["path"] = path
+            self.active_document["name"] = os.path.basename(path)
+            self.active_document["text"] = self.editor.text
         self.set_dirty(False)
         self.save_session()
         self.flash(f"Saved {os.path.basename(path)}")
@@ -1445,13 +1627,35 @@ class PythonIDE(App):
         return os.path.join(self.user_data_dir, "session.json")
 
     def save_session(self, *args):
-        data = {
-            "path": self.current_path,
-            "workspace": self.workspace,
-            "dirty": self.dirty,
-            "text": self.editor.text if self.dirty else None,
-        }
+        self._capture_active_document()
+        documents = []
+        for document in self.open_documents:
+            path = document.get("path")
+            dirty = bool(document.get("dirty"))
+            documents.append({
+                "path": path,
+                "name": document.get("name", "untitled.py"),
+                # Clean saved files are read from disk on restore. Unsaved and
+                # untitled buffers are included so switching tabs never loses text.
+                "text": (document.get("text", "")
+                         if dirty or not path else None),
+                "dirty": dirty,
+                "cursor": list(document.get("cursor", (0, 0))),
+                "scroll_x": document.get("scroll_x", 0),
+                "scroll_y": document.get("scroll_y", 1),
+            })
         try:
+            data = {
+                "path": self.current_path,
+                "workspace": self.workspace,
+                "dirty": self.dirty,
+                "text": self.editor.text if self.dirty else None,
+                "documents": documents,
+                "active_index": next(
+                    (i for i, item in enumerate(self.open_documents)
+                     if item is self.active_document), 0
+                ),
+            }
             write_text_file(self.session_path(), json.dumps(data))
         except Exception:
             pass
@@ -1462,6 +1666,69 @@ class PythonIDE(App):
                 data = json.load(handle)
         except Exception:
             return
+
+        saved_documents = data.get("documents")
+        if isinstance(saved_documents, list) and saved_documents:
+            self.open_documents = []
+            self.active_document = None
+            root_abs = os.path.abspath(self.workspace)
+            for saved in saved_documents:
+                if not isinstance(saved, dict):
+                    continue
+                path = saved.get("path")
+                if path:
+                    try:
+                        path_abs = os.path.abspath(path)
+                        inside = os.path.commonpath((path_abs, root_abs)) == root_abs
+                    except (TypeError, ValueError, OSError):
+                        inside = False
+                    if not inside or not os.path.isfile(path_abs):
+                        # Preserve an unsaved buffer even if its original file
+                        # was removed; it becomes an untitled document instead.
+                        if saved.get("dirty") and isinstance(saved.get("text"), str):
+                            path = None
+                        else:
+                            continue
+                    else:
+                        path = path_abs
+                text = saved.get("text")
+                if not isinstance(text, str):
+                    if path:
+                        try:
+                            text = read_text_file(path)
+                        except Exception:
+                            continue
+                    else:
+                        text = ""
+                document = self._new_document(
+                    path=path, text=text, dirty=bool(saved.get("dirty")),
+                    name=saved.get("name"),
+                )
+                cursor = saved.get("cursor", (0, 0))
+                if isinstance(cursor, (list, tuple)) and len(cursor) == 2:
+                    try:
+                        document["cursor"] = (int(cursor[0]), int(cursor[1]))
+                    except (TypeError, ValueError):
+                        pass
+                for key in ("scroll_x", "scroll_y"):
+                    try:
+                        document[key] = float(saved.get(key, document[key]))
+                    except (TypeError, ValueError):
+                        pass
+                self.open_documents.append(document)
+
+            if self.open_documents:
+                try:
+                    index = int(data.get("active_index", 0))
+                except (TypeError, ValueError):
+                    index = 0
+                index = max(0, min(index, len(self.open_documents) - 1))
+                self.activate_document(
+                    self.open_documents[index], persist=False
+                )
+                return
+
+        # Backward compatibility with the original single-file session format.
         path = data.get("path")
         if path:
             try:
@@ -1485,6 +1752,12 @@ class PythonIDE(App):
                 self.set_dirty(False)
             except Exception:
                 pass
+        document = self._new_document(
+            self.current_path, self.editor.text, self.dirty
+        )
+        self.open_documents = [document]
+        self.active_document = document
+        self._capture_active_document()
 
     # ------------------------------------------------------------------
     # Popups and dialogs
@@ -1544,20 +1817,66 @@ class PythonIDE(App):
     def show_message(self, title, message):
         self.show_dialog(title, message, [("OK", None, "primary")])
 
+    def has_unsaved_documents(self):
+        return bool(self.dirty or any(
+            document.get("dirty") for document in self.open_documents
+        ))
+
     def guard_unsaved(self, then):
-        """Run `then`, asking first if there are unsaved changes."""
-        if not self.dirty:
+        """Run `then` only after all dirty tabs are saved or explicitly discarded."""
+        dirty_documents = [
+            document for document in self.open_documents
+            if document.get("dirty")
+        ]
+        if not dirty_documents and not self.dirty:
             then()
             return
+        if not any(document is self.active_document
+                   for document in dirty_documents):
+            if dirty_documents:
+                self.activate_document(dirty_documents[0])
+
+        count = len(dirty_documents) or 1
+        if count > 1:
+            message = (
+                "%d open files have unsaved changes. Save each tab before "
+                "continuing, or discard all of them." % count
+            )
+            discard_label = "Discard all"
+        else:
+            message = (
+                "Save changes to %s before continuing?" % self.current_name()
+            )
+            discard_label = "Discard"
+
         self.show_dialog(
-            "Unsaved changes",
-            f"Save changes to {self.current_name()} before continuing?",
+            "Unsaved changes", message,
             [
                 ("Cancel", None, "neutral"),
-                ("Discard", then, "danger"),
-                ("Save", lambda: self.save_file(then=then), "primary"),
+                (discard_label, then, "danger"),
+                ("Save", lambda: self.save_file(
+                    then=partial(self._guard_unsaved_next, then)
+                ), "primary"),
             ],
         )
+
+    def _guard_unsaved_next(self, then):
+        """Continue the save/discard check after saving one dirty tab."""
+        self.guard_unsaved(then)
+
+    def _save_all_documents_then(self, then):
+        """Save dirty tabs one by one, then invoke the supplied callback."""
+        dirty_documents = [
+            document for document in self.open_documents
+            if document.get("dirty")
+        ]
+        if not dirty_documents and not self.dirty:
+            then()
+            return
+        target = dirty_documents[0] if dirty_documents else self.active_document
+        if target is not None and target is not self.active_document:
+            self.activate_document(target)
+        self.save_file(then=partial(self._save_all_documents_then, then))
 
     def choose_project_folder(self):
         """Launch the Android system picker for a persistent project folder."""
@@ -1665,7 +1984,6 @@ class PythonIDE(App):
     def _start_project_import(self, folder, target):
         self.set_state("Importing project...")
         self.file_button.disabled = True
-        self.edit_button.disabled = True
         self.run_button.disabled = True
         self.editor.disabled = True
 
@@ -1703,7 +2021,6 @@ class PythonIDE(App):
     def _finish_project_import(self, folder, target, stats, error, dt):
         self._project_import_thread = None
         self.file_button.disabled = False
-        self.edit_button.disabled = False
         self.run_button.disabled = False
         self.editor.disabled = False
         if error:
@@ -1719,9 +2036,7 @@ class PythonIDE(App):
         self.active_project_root = target
         self.workspace = target
         self._explorer_current_dir = target
-        self.current_path = None
-        self.set_editor_text("")
-        self.set_dirty(False)
+        self._reset_documents("", create=False)
 
         # Open a conventional root entry point when present; otherwise leave a
         # clean buffer so the user can choose any file from the File menu.
@@ -1732,7 +2047,7 @@ class PythonIDE(App):
         if entrypoint:
             self.open_file(entrypoint)
         else:
-            self.save_session()
+            self._reset_documents("", create=True)
 
         self.set_state("Project ready")
         self.flash(
@@ -1792,22 +2107,22 @@ class PythonIDE(App):
             )
             return
 
-        if self.dirty:
+        if self.has_unsaved_documents():
             if delete_missing:
                 message = (
-                    "The editor has unsaved changes. Save them before syncing and "
+                    "One or more open files have unsaved changes. Save them before syncing and "
                     "deleting removed files?"
                 )
             else:
                 message = (
-                    "The editor has unsaved changes. Save them before syncing? "
+                    "One or more open files have unsaved changes. Save them before syncing? "
                     "You can also sync the files already saved in the project copy."
                 )
             actions = [
                 ("Cancel", None, "neutral"),
                 ("Sync saved files", lambda: self._start_project_sync(
                     folder, self.active_project_root, delete_missing), "neutral"),
-                ("Save & sync", lambda: self.save_file(then=partial(
+                ("Save all & sync", lambda: self._save_all_documents_then(partial(
                     self._start_project_sync, folder, self.active_project_root,
                     delete_missing)), "primary"),
             ]
@@ -1839,7 +2154,6 @@ class PythonIDE(App):
             return
         self.set_state("Preparing project sync...")
         self.file_button.disabled = True
-        self.edit_button.disabled = True
         self.run_button.disabled = True
         self.editor.disabled = True
 
@@ -1882,7 +2196,6 @@ class PythonIDE(App):
     def _finish_project_sync(self, stats, error, dt):
         self._project_sync_thread = None
         self.file_button.disabled = False
-        self.edit_button.disabled = False
         self.run_button.disabled = False
         self.editor.disabled = False
         if error:
@@ -1952,8 +2265,9 @@ class PythonIDE(App):
 
         actions = (
             ("Project explorer", self.open_project_explorer),
-            ("New file", lambda: self.guard_unsaved(self.new_file)),
-            ("Open file", lambda: self.guard_unsaved(self.show_open_dialog)),
+            ("New file", self.new_file),
+            ("Open file", self.show_open_dialog),
+            ("Edit actions", self.show_edit_menu),
             ("Save", self.save_file),
             ("Save as", self.show_save_as),
             ("Choose project folder", self.choose_project_folder),
@@ -2299,9 +2613,7 @@ class PythonIDE(App):
             self.flash("Asset file: use the relative path %s" % relative, seconds=4)
             return
         self.close_popup()
-        if path == self.current_path and not self.dirty:
-            return
-        self.guard_unsaved(lambda: self.open_file(path))
+        self.open_file(path)
 
     def _prompt_explorer_name(self, title, initial, callback, hint,
                               return_directory=None):
@@ -2367,10 +2679,8 @@ class PythonIDE(App):
         self.show_project_explorer(parent)
 
     def _begin_explorer_new_file(self, parent):
-        if self.dirty:
-            self.guard_unsaved(lambda: self._prompt_explorer_new_file(parent))
-        else:
-            self._prompt_explorer_new_file(parent)
+        # A new project file gets its own tab; the current unsaved tab is kept.
+        self._prompt_explorer_new_file(parent)
 
     def _prompt_explorer_new_file(self, parent):
         self._prompt_explorer_name(
@@ -2394,10 +2704,7 @@ class PythonIDE(App):
             self.show_message("Could not create file", str(exc))
             return
         self.close_popup()
-        self.current_path = target
-        self.set_editor_text("")
-        self.set_dirty(False)
-        self.save_session()
+        self.open_file(target)
         self.flash("Created %s" % filename)
 
     def _explorer_rename_item(self, path, instance=None):
@@ -2433,11 +2740,22 @@ class PythonIDE(App):
                 raise FileExistsError("An item with that name already exists.")
             os.rename(old_path, new_path)
 
-            # Keep an open editor buffer attached to its renamed file or folder.
-            if self.current_path and is_path_inside(old_path, self.current_path):
-                relative_file = os.path.relpath(self.current_path, old_path)
-                self.current_path = (new_path if relative_file == "."
-                                     else os.path.join(new_path, relative_file))
+            # Keep every open editor buffer attached to its renamed file/folder.
+            self._capture_active_document()
+            changed_tabs = False
+            for document in self.open_documents:
+                doc_path = document.get("path")
+                if doc_path and is_path_inside(old_path, doc_path):
+                    relative_file = os.path.relpath(doc_path, old_path)
+                    document["path"] = (
+                        new_path if relative_file == "."
+                        else os.path.join(new_path, relative_file)
+                    )
+                    document["name"] = os.path.basename(document["path"])
+                    changed_tabs = True
+            if self.active_document is not None:
+                self.current_path = self.active_document.get("path")
+            if changed_tabs:
                 self.update_tab()
                 self.save_session()
 
@@ -2489,10 +2807,20 @@ class PythonIDE(App):
             else:
                 os.remove(path)
 
-            # Preserve unsaved text in memory, but detach it from the removed file.
-            if self.current_path and is_path_inside(path, self.current_path):
-                self.current_path = None
-                self.set_dirty(True)
+            # Preserve open buffers, but detach tabs backed by deleted items.
+            self._capture_active_document()
+            detached = False
+            for document in self.open_documents:
+                doc_path = document.get("path")
+                if doc_path and is_path_inside(path, doc_path):
+                    document["path"] = None
+                    document["dirty"] = True
+                    detached = True
+            if self.active_document is not None:
+                self.current_path = self.active_document.get("path")
+                self.dirty = bool(self.active_document.get("dirty"))
+            if detached:
+                self.set_dirty(self.dirty)
                 self.save_session()
 
             current_dir = self._explorer_current_dir
@@ -2505,14 +2833,141 @@ class PythonIDE(App):
         self.flash("Deleted %s" % os.path.basename(path))
         self.show_project_explorer(self._explorer_current_dir)
 
+    def _open_internal_storage_from_dialog(self, instance=None):
+        self.close_popup()
+        Clock.schedule_once(
+            lambda _dt: self.open_from_internal_storage(), 0.15
+        )
+
+    def open_from_internal_storage(self, instance=None):
+        """Import one file from Android's system document picker into the workspace."""
+        if platform != "android":
+            self.show_message(
+                "Internal storage",
+                "Open from internal storage is available in the Android app."
+            )
+            return
+        if self.worker is not None:
+            self.show_message(
+                "Program is running",
+                "Stop the running program before opening another file."
+            )
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+            activity = PythonActivity.mActivity
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            # Keep the listener bound until Android returns the selected URI.
+            if not self._android_file_picker_bound:
+                activity.bind(on_activity_result=self._on_android_file_result)
+                self._android_file_picker_bound = True
+            activity.startActivityForResult(
+                intent, self._android_file_picker_request
+            )
+            self.flash("Choose a file from internal storage")
+        except Exception as exc:
+            self.show_message("Could not open storage picker", str(exc))
+
+    def _on_android_file_result(self, request_code, result_code, intent):
+        """Read the selected SAF URI and copy it into the active IDE workspace."""
+        if request_code != self._android_file_picker_request:
+            return
+        if result_code != -1 or intent is None:  # Activity.RESULT_OK
+            self.flash("File selection cancelled")
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            OpenableColumns = autoclass(
+                "android.provider.OpenableColumns"
+            )
+            activity = PythonActivity.mActivity
+            uri = intent.getData()
+            if uri is None:
+                raise ValueError("Android did not return a file location.")
+
+            name = None
+            cursor = activity.getContentResolver().query(
+                uri, None, None, None, None
+            )
+            if cursor is not None:
+                try:
+                    if cursor.moveToFirst():
+                        column = cursor.getColumnIndex(
+                            OpenableColumns.DISPLAY_NAME
+                        )
+                        if column >= 0:
+                            name = str(cursor.getString(column))
+                finally:
+                    cursor.close()
+            if not name:
+                name = str(uri.getLastPathSegment() or "imported_file")
+                name = name.rsplit(":", 1)[-1]
+            name = os.path.basename(name.replace("\\", "/")).strip()
+            if not name or name in (".", ".."):
+                name = "imported_file"
+
+            descriptor = activity.getContentResolver().openFileDescriptor(
+                uri, "r"
+            )
+            if descriptor is None:
+                raise OSError("Android could not read the selected file.")
+            try:
+                source_fd = os.dup(descriptor.getFd())
+                with os.fdopen(source_fd, "rb") as source:
+                    data = source.read(MAX_FILE_BYTES + 1)
+            finally:
+                descriptor.close()
+            if len(data) > MAX_FILE_BYTES:
+                raise ValueError(
+                    "This file is larger than the IDE's 1 MB open-file limit."
+                )
+            try:
+                text = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise ValueError(
+                    "This file is not valid UTF-8 text and cannot be opened in the code editor."
+                )
+
+            os.makedirs(self.workspace, exist_ok=True)
+            target = os.path.join(self.workspace, name)
+            if os.path.exists(target):
+                stem, extension = os.path.splitext(name)
+                index = 1
+                while os.path.exists(target):
+                    target = os.path.join(
+                        self.workspace, "%s_imported_%d%s" % (
+                            stem, index, extension
+                        )
+                    )
+                    index += 1
+            with open(target, "w", encoding="utf-8", newline="\n") as output:
+                output.write(text)
+            self.open_file(target)
+            self.flash("Imported %s" % os.path.basename(target))
+        except Exception as exc:
+            self.show_message("Could not open selected file", str(exc))
+
     def show_open_dialog(self):
         self.editor.focus = False
         files = self.list_files()
         content = BoxLayout(orientation="vertical", padding=dp(10),
                             spacing=dp(8))
         content.add_widget(make_label(
-            f"Folder: {self.workspace}", size=11, color=C_MUTED, valign="top",
+            f"Workspace: {self.workspace}", size=11, color=C_MUTED, valign="top",
             size_hint_y=None, height=dp(34)))
+
+        internal_button = FlatButton(
+            text="Open from internal storage",
+            bg=C_PRIMARY, size_hint_y=None, height=dp(48),
+        )
+        internal_button.bind(on_release=self._open_internal_storage_from_dialog)
+        content.add_widget(internal_button)
 
         if not files:
             content.add_widget(make_label(
@@ -2537,7 +2992,10 @@ class PythonIDE(App):
     def make_file_row(self, name, path, size, mtime):
         row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(4))
         stamp = time.strftime("%d %b %H:%M", time.localtime(mtime))
-        marker = DIRTY_DOT if path == self.current_path else ""
+        marker = DIRTY_DOT if any(
+            doc.get("path") == path and doc.get("dirty")
+            for doc in self.open_documents
+        ) else ""
         label = (f"{marker}{escape_markup(name)}\n"
                  f"[size={int(sp(11))}][color=8b93b5]{format_size(size)}"
                  f"  \u00b7  {stamp}[/color][/size]")
@@ -2556,9 +3014,7 @@ class PythonIDE(App):
 
     def pick_file(self, path, instance):
         self.close_popup()
-        if path == self.current_path and not self.dirty:
-            return
-        self.guard_unsaved(lambda: self.open_file(path))
+        self.open_file(path)
 
     def confirm_delete(self, name, path, instance):
         self.show_dialog(
@@ -2576,10 +3032,19 @@ class PythonIDE(App):
         except Exception as exc:
             self.show_message("Could not delete file", str(exc))
             return
-        if path == self.current_path:
-            # Keep the text in the editor, but it is no longer backed by a file.
-            self.current_path = None
-            self.set_dirty(True)
+        self._capture_active_document()
+        detached = False
+        for document in self.open_documents:
+            if document.get("path") == path:
+                document["path"] = None
+                document["dirty"] = True
+                detached = True
+        if self.active_document is not None:
+            self.current_path = self.active_document.get("path")
+            self.dirty = bool(self.active_document.get("dirty"))
+        if detached:
+            self.set_dirty(self.dirty)
+            self.save_session()
         self.flash(f"Deleted {os.path.basename(path)}")
         self.show_open_dialog()
 
