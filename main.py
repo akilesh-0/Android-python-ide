@@ -19,7 +19,7 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import Color, Line, Rectangle, Triangle
+from kivy.graphics import Color, Ellipse, Line, Rectangle, Triangle
 from kivy.graphics.instructions import InstructionGroup
 from kivy.metrics import dp, sp
 from kivy.resources import resource_find
@@ -266,28 +266,243 @@ class FlatButton(Button):
 
 
 class IconButton(FlatButton):
-    """Button that draws a play or stop icon instead of text."""
+    """Flat button with a small vector icon, optionally followed by a label."""
 
-    def __init__(self, icon, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, icon, label=None, **kwargs):
+        text = kwargs.pop("text", "")
+        if text:
+            kwargs.setdefault("halign", "left")
+            kwargs.setdefault("padding", [dp(40), 0])
+        super().__init__(text=text, **kwargs)
         self.icon = icon
+        # Kept as descriptive metadata for future accessibility integration.
+        self.accessibility_label = label or text or icon.replace("-", " ").title()
         self.bind(pos=self._draw_icon, size=self._draw_icon,
-                  disabled=self._draw_icon)
+                  disabled=self._draw_icon, color=self._draw_icon)
         self._draw_icon()
 
     def _draw_icon(self, *args):
         self.canvas.after.clear()
-        cx, cy = self.center
-        s = min(self.width, self.height) * 0.30
-        alpha = 0.35 if self.disabled else 1
+        cx = self.x + dp(19) if self.text else self.center_x
+        cy = self.center_y
+        size = min(self.height * 0.30, dp(10))
+        if size <= 0:
+            return
+        left, right = cx - size, cx + size
+        bottom, top = cy - size, cy + size
+        alpha = 0.38 if self.disabled else 1.0
+        rgb = self.color[:3]
+        weight = max(1.15, dp(1.55))
+
+        def stroke(points, close=False, width=weight):
+            Line(points=points, close=close, width=width)
+
+        def filled_rect(x, y, w, h):
+            Rectangle(pos=(x, y), size=(w, h))
+
         with self.canvas.after:
-            Color(1, 1, 1, alpha)
-            if self.icon == "play":
-                Triangle(points=[cx - s * 0.7, cy - s, cx - s * 0.7, cy + s,
-                                 cx + s * 1.0, cy])
+            Color(rgb[0], rgb[1], rgb[2], alpha)
+            icon = self.icon
+
+            if icon == "menu":
+                for y in (cy + size * 0.65, cy, cy - size * 0.65):
+                    stroke([cx - size, y, cx + size, y], width=weight * 1.2)
+            elif icon == "play":
+                Triangle(points=[cx - size * 0.65, cy - size,
+                                 cx - size * 0.65, cy + size,
+                                 cx + size, cy])
+            elif icon == "stop":
+                filled_rect(cx - size * 0.72, cy - size * 0.72,
+                            size * 1.44, size * 1.44)
+            elif icon in ("folder", "folder-open", "folder-plus"):
+                if icon == "folder-open":
+                    stroke([left, cy + size * 0.35,
+                            cx - size * 0.25, cy + size * 0.35,
+                            right, cy - size * 0.28,
+                            cx + size * 0.70, bottom,
+                            left, bottom], close=True)
+                    stroke([left, cy + size * 0.35, left, cy + size * 0.75,
+                            cx - size * 0.25, cy + size * 0.75,
+                            cx - size * 0.05, cy + size * 0.48])
+                else:
+                    stroke([left, bottom, left, cy + size * 0.42,
+                            cx - size * 0.28, cy + size * 0.42,
+                            cx - size * 0.05, top,
+                            right, top, right, bottom], close=True)
+                if icon == "folder-plus":
+                    stroke([cx + size * 0.35, cy - size * 0.05,
+                            cx + size * 0.35, cy - size * 0.78], width=weight * 1.25)
+                    stroke([cx, cy - size * 0.42,
+                            cx + size * 0.70, cy - size * 0.42], width=weight * 1.25)
+            elif icon in ("file", "file-plus", "file-code"):
+                stroke([cx - size * 0.62, bottom,
+                        cx - size * 0.62, top,
+                        cx + size * 0.20, top,
+                        right, cy + size * 0.35,
+                        right, bottom], close=True)
+                stroke([cx + size * 0.20, top,
+                        cx + size * 0.20, cy + size * 0.35,
+                        right, cy + size * 0.35])
+                if icon == "file-plus":
+                    stroke([cx - size * 0.30, cy - size * 0.25,
+                            cx + size * 0.62, cy - size * 0.25])
+                    stroke([cx + size * 0.16, cy - size * 0.70,
+                            cx + size * 0.16, cy + size * 0.18])
+                elif icon == "file-code":
+                    stroke([cx - size * 0.35, cy - size * 0.12,
+                            cx - size * 0.55, cy - size * 0.30,
+                            cx - size * 0.35, cy - size * 0.50])
+                    stroke([cx + size * 0.22, cy - size * 0.12,
+                            cx + size * 0.42, cy - size * 0.30,
+                            cx + size * 0.22, cy - size * 0.50])
+            elif icon == "save":
+                stroke([left, bottom, left, top, right, top, right, bottom], close=True)
+                stroke([cx - size * 0.48, top,
+                        cx - size * 0.48, cy + size * 0.22,
+                        cx + size * 0.48, cy + size * 0.22,
+                        cx + size * 0.48, top])
+                stroke([cx - size * 0.48, bottom,
+                        cx - size * 0.48, cy - size * 0.30,
+                        cx + size * 0.48, cy - size * 0.30,
+                        cx + size * 0.48, bottom])
+            elif icon in ("pencil", "rename"):
+                stroke([cx - size * 0.82, cy - size * 0.72,
+                        cx + size * 0.52, cy + size * 0.62,
+                        cx + size * 0.86, cy + size * 0.28,
+                        cx - size * 0.48, cy - size * 1.06])
+                stroke([cx - size * 0.98, cy - size * 0.95,
+                        cx - size * 0.82, cy - size * 0.72,
+                        cx - size * 0.48, cy - size * 1.06])
+            elif icon == "trash":
+                stroke([cx - size * 0.62, cy + size * 0.55,
+                        cx - size * 0.50, bottom,
+                        cx + size * 0.50, bottom,
+                        cx + size * 0.62, cy + size * 0.55], close=True)
+                stroke([cx - size * 0.82, cy + size * 0.68,
+                        cx + size * 0.82, cy + size * 0.68])
+                stroke([cx - size * 0.30, top,
+                        cx + size * 0.30, top])
+                stroke([cx - size * 0.20, cy + size * 0.38,
+                        cx - size * 0.12, cy - size * 0.55])
+                stroke([cx + size * 0.20, cy + size * 0.38,
+                        cx + size * 0.12, cy - size * 0.55])
+            elif icon == "send":
+                stroke([left, cy, right, top,
+                        cx + size * 0.22, bottom,
+                        cx - size * 0.05, cy - size * 0.08,
+                        left, cy], close=True)
+                stroke([cx - size * 0.05, cy - size * 0.08,
+                        right, top])
+            elif icon in ("x", "close"):
+                stroke([left * 0 + cx - size * 0.68, cy - size * 0.68,
+                        cx + size * 0.68, cy + size * 0.68], width=weight * 1.25)
+                stroke([cx - size * 0.68, cy + size * 0.68,
+                        cx + size * 0.68, cy - size * 0.68], width=weight * 1.25)
+            elif icon == "check":
+                stroke([cx - size * 0.82, cy,
+                        cx - size * 0.20, cy - size * 0.62,
+                        cx + size * 0.88, cy + size * 0.72], width=weight * 1.3)
+            elif icon == "arrow-right":
+                stroke([cx - size * 0.88, cy, cx + size * 0.78, cy])
+                stroke([cx + size * 0.18, cy + size * 0.68,
+                        cx + size * 0.88, cy,
+                        cx + size * 0.18, cy - size * 0.68])
+            elif icon in ("arrow-up", "up"):
+                stroke([cx, bottom, cx, top])
+                stroke([cx - size * 0.68, cy + size * 0.30,
+                        cx, top, cx + size * 0.68, cy + size * 0.30])
+            elif icon == "refresh":
+                stroke([cx + size * 0.68, cy + size * 0.35,
+                        cx + size * 0.68, top,
+                        cx - size * 0.05, top,
+                        cx - size * 0.72, cy + size * 0.35,
+                        cx - size * 0.72, cy - size * 0.32,
+                        cx - size * 0.20, bottom])
+                stroke([cx - size * 0.72, cy - size * 0.35,
+                        cx - size * 0.72, bottom,
+                        cx + size * 0.05, bottom,
+                        cx + size * 0.72, cy - size * 0.35,
+                        cx + size * 0.72, cy + size * 0.32,
+                        cx + size * 0.20, top])
+            elif icon == "terminal":
+                stroke([left, bottom, left, top, right, top, right, bottom], close=True)
+                stroke([cx - size * 0.62, cy + size * 0.25,
+                        cx - size * 0.25, cy - size * 0.06,
+                        cx - size * 0.62, cy - size * 0.38])
+                stroke([cx - size * 0.05, cy - size * 0.43,
+                        cx + size * 0.52, cy - size * 0.43])
+            elif icon == "select-all":
+                # Four corner brackets communicate a selection region.
+                for sx, sy in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+                    x = cx + sx * size * 0.72
+                    y = cy + sy * size * 0.72
+                    stroke([x, y - sy * size * 0.28,
+                            x, y, x - sx * size * 0.28, y])
+            elif icon == "text":
+                stroke([cx - size * 0.68, top,
+                        cx + size * 0.68, top])
+                stroke([cx, top, cx, bottom])
+                stroke([cx - size * 0.42, bottom,
+                        cx + size * 0.42, bottom])
+            elif icon == "cut":
+                for loop_y in (cy + size * 0.40, cy - size * 0.40):
+                    rr = size * 0.25
+                    stroke([cx - size * 0.62, loop_y + rr,
+                            cx - size * 0.38, loop_y + rr * 0.72,
+                            cx - size * 0.30, loop_y,
+                            cx - size * 0.38, loop_y - rr * 0.72,
+                            cx - size * 0.62, loop_y - rr,
+                            cx - size * 0.86, loop_y - rr * 0.72,
+                            cx - size * 0.94, loop_y,
+                            cx - size * 0.86, loop_y + rr * 0.72], close=True)
+                stroke([cx - size * 0.36, cy + size * 0.30,
+                        cx + size * 0.84, cy - size * 0.74])
+                stroke([cx - size * 0.36, cy - size * 0.42,
+                        cx + size * 0.84, cy + size * 0.74])
+            elif icon == "copy":
+                stroke([cx - size * 0.42, cy - size * 0.55,
+                        cx - size * 0.42, top,
+                        right, top, right, cy + size * 0.20], close=True)
+                stroke([cx - size * 0.82, bottom,
+                        cx - size * 0.82, cy + size * 0.48,
+                        cx + size * 0.22, cy + size * 0.48,
+                        cx + size * 0.22, bottom], close=True)
+            elif icon == "clipboard":
+                stroke([cx - size * 0.70, bottom,
+                        cx - size * 0.70, cy + size * 0.62,
+                        cx - size * 0.30, cy + size * 0.62,
+                        cx - size * 0.18, top,
+                        cx + size * 0.18, top,
+                        cx + size * 0.30, cy + size * 0.62,
+                        cx + size * 0.70, cy + size * 0.62,
+                        cx + size * 0.70, bottom], close=True)
+                stroke([cx - size * 0.36, cy + size * 0.05,
+                        cx + size * 0.36, cy + size * 0.05])
+                stroke([cx - size * 0.36, cy - size * 0.35,
+                        cx + size * 0.36, cy - size * 0.35])
+            elif icon == "sync":
+                stroke([cx - size * 0.80, cy + size * 0.25,
+                        cx + size * 0.58, cy + size * 0.25,
+                        cx + size * 0.28, cy + size * 0.58])
+                stroke([cx + size * 0.80, cy - size * 0.25,
+                        cx - size * 0.58, cy - size * 0.25,
+                        cx - size * 0.28, cy - size * 0.58])
+            elif icon == "import":
+                stroke([cx, top, cx, cy - size * 0.12])
+                stroke([cx - size * 0.55, cy + size * 0.38,
+                        cx, cy - size * 0.18,
+                        cx + size * 0.55, cy + size * 0.38])
+                stroke([left, cy - size * 0.45,
+                        left, bottom, right, bottom,
+                        right, cy - size * 0.45])
+            elif icon == "plus":
+                stroke([cx - size * 0.78, cy, cx + size * 0.78, cy], width=weight * 1.25)
+                stroke([cx, cy - size * 0.78, cx, cy + size * 0.78], width=weight * 1.25)
             else:
-                Rectangle(pos=(cx - s * 0.85, cy - s * 0.85),
-                          size=(s * 1.7, s * 1.7))
+                # Unknown icon names get a clear neutral dot rather than a
+                # misleading icon or a blank control.
+                Ellipse(pos=(cx - size * 0.22, cy - size * 0.22),
+                        size=(size * 0.44, size * 0.44))
 
 
 class ConsoleStream:
@@ -1019,8 +1234,8 @@ class PythonIDE(App):
         root.add_widget(self.build_file_tabs())
         root.add_widget(self.build_editor_area())
         root.add_widget(self.build_console())
-        root.add_widget(self.build_status_bar())
-        # Keep the custom coding keys immediately above the Android keyboard.
+        # Keep the custom coding keys at the bottom, immediately above the
+        # Android keyboard. The old blue status strip is intentionally removed.
         root.add_widget(self.build_symbol_bar())
 
         Window.bind(on_keyboard=self.on_keyboard, on_key_down=self.on_key_down)
@@ -1050,12 +1265,21 @@ class PythonIDE(App):
                         padding=[dp(8), dp(3), dp(6), dp(3)], spacing=dp(6))
         paint(bar, C_BAR)
 
+        # Reserved hamburger placeholder for a future navigation menu.
+        # It intentionally has no callback or menu actions yet.
+        self.menu_button = IconButton(
+            "menu", label="Menu", bg=C_BTN, size_hint_x=None,
+            width=dp(38),
+        )
+        bar.add_widget(self.menu_button)
+
         self.tab_label = make_label(size=13, markup=True, bold=True)
         bar.add_widget(self.tab_label)
 
-        self.file_button = FlatButton(
-            text="FILE", bg=C_BTN, size_hint_x=None, width=dp(50),
-            font_size=sp(11),
+        self.file_button = IconButton(
+            "folder", text="FILE", label="File actions", bg=C_BTN,
+            size_hint_x=None, width=dp(68), font_size=sp(11),
+            padding=[dp(34), 0],
         )
         self.file_button.bind(on_release=self.show_file_menu)
         self.run_button = IconButton("play", bg=C_RUN, size_hint_x=None,
@@ -1173,9 +1397,10 @@ class PythonIDE(App):
                            padding=[dp(12), 0, dp(4), 0])
         paint(header, C_BAR)
         header.add_widget(make_label("OUTPUT", size=11, color=C_MUTED, bold=True))
-        clear_button = FlatButton(text="CLEAR", bg=C_BAR, fg=C_MUTED,
-                                  size_hint_x=None, width=dp(64),
-                                  font_size=sp(11))
+        clear_button = IconButton(
+            "trash", label="Clear output", bg=C_BAR, fg=C_MUTED,
+            size_hint_x=None, width=dp(42),
+        )
         clear_button.bind(on_release=self.clear_output)
         header.add_widget(clear_button)
         content.add_widget(header)
@@ -1210,8 +1435,10 @@ class PythonIDE(App):
         )
         self.style_input(self.input_field)
         self.input_field.bind(on_text_validate=self.submit_input)
-        send_button = FlatButton(text="SEND", bg=C_PRIMARY, size_hint_x=None,
-                                 width=dp(72))
+        send_button = IconButton(
+            "send", label="Send input", bg=C_PRIMARY,
+            size_hint_x=None, width=dp(44),
+        )
         send_button.bind(on_release=self.submit_input)
         self.input_panel.add_widget(self.input_field)
         self.input_panel.add_widget(send_button)
@@ -1371,19 +1598,21 @@ class PythonIDE(App):
     # Status bar and tab title
     # ------------------------------------------------------------------
     def set_state(self, text):
+        # Keep the internal run/import state even though the blue status strip
+        # is no longer part of the phone UI.
         self.state_text = text
-        if self._status_event is None:
-            self.state_label.text = text
 
     def flash(self, message, seconds=2.5):
+        # Preserve the existing notification timing/state behaviour without
+        # relying on a status-bar widget that is no longer displayed.
         if self._status_event is not None:
             self._status_event.cancel()
-        self.state_label.text = message
+        self._flash_text = message
         self._status_event = Clock.schedule_once(self._end_flash, seconds)
 
     def _end_flash(self, dt):
         self._status_event = None
-        self.state_label.text = self.state_text
+        self._flash_text = None
 
     def _new_document(self, path=None, text="", dirty=False, name=None):
         """Create an editor-buffer record without changing the visible editor."""
@@ -1802,8 +2031,18 @@ class PythonIDE(App):
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         popup = self.open_popup(title, content, height=height)
         colors = {"primary": C_PRIMARY, "danger": C_STOP}
+        action_icons = {
+            "OK": "check", "Cancel": "x", "Save": "save",
+            "Overwrite": "save", "Delete": "trash", "Continue": "arrow-right",
+            "Sync saved files": "sync", "Save all & sync": "sync",
+        }
         for label, callback, kind in actions:
-            button = FlatButton(text=label, bg=colors.get(kind, C_BTN))
+            button = IconButton(
+                action_icons.get(label, "check" if kind == "primary" else
+                                 "trash" if kind == "danger" else "file"),
+                text=label, bg=colors.get(kind, C_BTN),
+                size_hint_x=1,
+            )
             button.bind(on_release=partial(self._dialog_action, popup, callback))
             row.add_widget(button)
         content.add_widget(row)
@@ -2264,27 +2503,28 @@ class PythonIDE(App):
         content.add_widget(folder_status)
 
         actions = (
-            ("Project explorer", self.open_project_explorer),
-            ("New file", self.new_file),
-            ("Open file", self.show_open_dialog),
-            ("Edit actions", self.show_edit_menu),
-            ("Save", self.save_file),
-            ("Save as", self.show_save_as),
-            ("Choose project folder", self.choose_project_folder),
-            ("Import selected project", self.import_project_folder),
-            ("Sync project to selected folder", self.sync_project_folder),
-            ("Sync + delete removed items", self.confirm_project_sync_with_deletions),
+            ("Project explorer", "folder-open", self.open_project_explorer),
+            ("New file", "file-plus", self.new_file),
+            ("Open file", "folder", self.show_open_dialog),
+            ("Edit actions", "pencil", self.show_edit_menu),
+            ("Save", "save", self.save_file),
+            ("Save as", "file-plus", self.show_save_as),
+            ("Choose project folder", "folder", self.choose_project_folder),
+            ("Import selected project", "import", self.import_project_folder),
+            ("Sync project to selected folder", "sync", self.sync_project_folder),
+            ("Sync + delete removed items", "sync", self.confirm_project_sync_with_deletions),
         )
-        for label, callback in actions:
-            button = FlatButton(
-                text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
-                halign="left", padding=[dp(16), 0],
+        for label, icon, callback in actions:
+            button = IconButton(
+                icon, text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
+                padding=[dp(42), 0],
             )
             button.bind(on_release=partial(self._dialog_action, popup, callback))
             content.add_widget(button)
 
-        close = FlatButton(
-            text="Close", bg=C_BAR, size_hint_y=None, height=dp(42)
+        close = IconButton(
+            "x", label="Close", bg=C_BAR,
+            size_hint_x=None, width=dp(44), size_hint_y=None, height=dp(42),
         )
         close.bind(on_release=lambda *args: popup.dismiss())
         content.add_widget(close)
@@ -2298,22 +2538,23 @@ class PythonIDE(App):
             "Edit", content, size_hint=(0.82, None), height=dp(340)
         )
         actions = (
-            ("Select all", self.select_all_text),
-            ("Select word", self.select_word_at_cursor),
-            ("Cut", self.cut_selection),
-            ("Copy", self.copy_selection),
-            ("Paste", self.paste_clipboard),
+            ("Select all", "select-all", self.select_all_text),
+            ("Select word", "text", self.select_word_at_cursor),
+            ("Cut", "cut", self.cut_selection),
+            ("Copy", "copy", self.copy_selection),
+            ("Paste", "clipboard", self.paste_clipboard),
         )
-        for label, callback in actions:
-            button = FlatButton(
-                text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
-                halign="left", padding=[dp(16), 0],
+        for label, icon, callback in actions:
+            button = IconButton(
+                icon, text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
+                padding=[dp(42), 0],
             )
             button.bind(on_release=partial(self._dialog_action, popup, callback))
             content.add_widget(button)
 
-        close = FlatButton(
-            text="Close", bg=C_BAR, size_hint_y=None, height=dp(40)
+        close = IconButton(
+            "x", label="Close", bg=C_BAR,
+            size_hint_x=None, width=dp(44), size_hint_y=None, height=dp(40),
         )
         close.bind(on_release=lambda *args: popup.dismiss())
         content.add_widget(close)
@@ -2367,8 +2608,8 @@ class PythonIDE(App):
         error = make_label("", size=12, color=C_STOP, size_hint_y=None,
                            height=dp(20))
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        cancel = FlatButton(text="Cancel")
-        save = FlatButton(text="Save", bg=C_PRIMARY)
+        cancel = IconButton("x", text="Cancel")
+        save = IconButton("save", text="Save", bg=C_PRIMARY)
         row.add_widget(cancel)
         row.add_widget(save)
         content.add_widget(field)
@@ -2463,22 +2704,29 @@ class PythonIDE(App):
 
         toolbar = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(5))
         parent = os.path.dirname(current)
-        up_button = FlatButton(
-            text="UP", bg=C_BTN, size_hint_x=None, width=dp(58),
-            disabled=(current == root),
+        up_button = IconButton(
+            "arrow-up", label="Go to parent folder", bg=C_BTN,
+            size_hint_x=None, width=dp(44), disabled=(current == root),
         )
         up_button.bind(on_release=lambda *_: self.show_project_explorer(parent))
-        folder_button = FlatButton(text="+ FOLDER", bg=C_BTN)
+        folder_button = IconButton(
+            "folder-plus", text="New folder", bg=C_BTN,
+            padding=[dp(38), 0],
+        )
         folder_button.bind(
             on_release=lambda *_: self._prompt_explorer_name(
                 "New folder", "", partial(self._create_explorer_folder, current),
                 "Folder name", return_directory=current,
             )
         )
-        file_button = FlatButton(text="+ PY FILE", bg=C_BTN)
+        file_button = IconButton(
+            "file-plus", text="New Python file", bg=C_BTN,
+            padding=[dp(38), 0],
+        )
         file_button.bind(on_release=lambda *_: self._begin_explorer_new_file(current))
-        refresh_button = FlatButton(
-            text="↻", bg=C_BTN, size_hint_x=None, width=dp(48)
+        refresh_button = IconButton(
+            "refresh", label="Refresh folder", bg=C_BTN,
+            size_hint_x=None, width=dp(44),
         )
         refresh_button.bind(on_release=lambda *_: self.show_project_explorer(current))
         for button in (up_button, folder_button, file_button, refresh_button):
@@ -2535,8 +2783,9 @@ class PythonIDE(App):
         scroll.add_widget(entries_box)
         content.add_widget(scroll)
 
-        close = FlatButton(
-            text="Close", bg=C_BAR, size_hint_y=None, height=dp(42)
+        close = IconButton(
+            "x", label="Close", bg=C_BAR,
+            size_hint_x=None, width=dp(44), size_hint_y=None, height=dp(42),
         )
         content.add_widget(close)
         title = "Project Explorer"
@@ -2559,13 +2808,15 @@ class PythonIDE(App):
         label = "%s\n[size=%d][color=8b93b5]%s[/color][/size]" % (
             title, int(sp(10)), escape_markup(detail)
         )
-        open_button = FlatButton(
-            text=label, bg=C_BTN, markup=True, halign="left",
-            valign="middle", font_size=sp(13),
+        open_button = IconButton(
+            "folder-open" if kind == 0 else "file-code",
+            text=label, label="Open " + ("folder " if kind == 0 else "file ") + name,
+            bg=C_BTN, markup=True, halign="left", valign="middle",
+            font_size=sp(13), padding=[dp(42), 0],
         )
         open_button.bind(
             size=lambda widget, value: setattr(
-                widget, "text_size", (max(0, value[0] - dp(16)), value[1])
+                widget, "text_size", (max(0, value[0] - dp(48)), value[1])
             )
         )
         if kind == 0:
@@ -2575,14 +2826,14 @@ class PythonIDE(App):
         else:
             open_button.bind(on_release=partial(self._explorer_open_file, path))
 
-        rename_button = FlatButton(
-            text="REN", bg=C_BTN, size_hint_x=None, width=dp(48),
-            font_size=sp(10),
+        rename_button = IconButton(
+            "pencil", label="Rename " + name, bg=C_BTN,
+            size_hint_x=None, width=dp(42),
         )
         rename_button.bind(on_release=partial(self._explorer_rename_item, path))
-        delete_button = FlatButton(
-            text="DEL", bg=C_BTN, fg=_c("#ff7b72"),
-            size_hint_x=None, width=dp(48), font_size=sp(10),
+        delete_button = IconButton(
+            "trash", label="Delete " + name, bg=C_BTN,
+            fg=_c("#ff7b72"), size_hint_x=None, width=dp(42),
         )
         delete_button.bind(on_release=partial(self._explorer_confirm_delete, path))
         row.add_widget(open_button)
@@ -2627,10 +2878,11 @@ class PythonIDE(App):
             "", size=11, color=C_STOP, size_hint_y=None, height=dp(28),
         )
         actions = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        cancel = FlatButton(text="Cancel", bg=C_BTN)
-        save = FlatButton(
-            text=("Apply" if title.lower().startswith("rename") else "Create"),
-            bg=C_PRIMARY,
+        cancel = IconButton("x", text="Cancel", bg=C_BTN)
+        save_label = "Apply" if title.lower().startswith("rename") else "Create"
+        save = IconButton(
+            "pencil" if save_label == "Apply" else "plus",
+            text=save_label, bg=C_PRIMARY,
         )
         actions.add_widget(cancel)
         actions.add_widget(save)
@@ -2962,8 +3214,8 @@ class PythonIDE(App):
             f"Workspace: {self.workspace}", size=11, color=C_MUTED, valign="top",
             size_hint_y=None, height=dp(34)))
 
-        internal_button = FlatButton(
-            text="Open from internal storage",
+        internal_button = IconButton(
+            "folder", text="Open from internal storage",
             bg=C_PRIMARY, size_hint_y=None, height=dp(48),
         )
         internal_button.bind(on_release=self._open_internal_storage_from_dialog)
@@ -2983,7 +3235,10 @@ class PythonIDE(App):
             scroll.add_widget(box)
             content.add_widget(scroll)
 
-        close = FlatButton(text="Close", size_hint_y=None, height=dp(44))
+        close = IconButton(
+            "x", label="Close", size_hint_x=None, width=dp(44),
+            size_hint_y=None, height=dp(44),
+        )
         content.add_widget(close)
         popup = self.open_popup("Open file", content, size_hint=(0.94, 0.72))
         close.bind(on_release=lambda *a: popup.dismiss())
@@ -2999,14 +3254,18 @@ class PythonIDE(App):
         label = (f"{marker}{escape_markup(name)}\n"
                  f"[size={int(sp(11))}][color=8b93b5]{format_size(size)}"
                  f"  \u00b7  {stamp}[/color][/size]")
-        open_button = FlatButton(text=label, markup=True, halign="left",
-                                 valign="middle", font_size=sp(14))
+        open_button = IconButton(
+            "file-code", text=label, label="Open " + name,
+            markup=True, halign="left", valign="middle", font_size=sp(14),
+            padding=[dp(42), 0],
+        )
         open_button.bind(
-            size=lambda w, s: setattr(w, "text_size", (s[0] - dp(20), s[1])))
+            size=lambda w, s: setattr(w, "text_size", (s[0] - dp(48), s[1])))
         open_button.bind(on_release=partial(self.pick_file, path))
-        delete_button = FlatButton(text="DEL", bg=C_BTN, fg=_c("#ff7b72"),
-                                   size_hint_x=None, width=dp(56),
-                                   font_size=sp(12))
+        delete_button = IconButton(
+            "trash", label="Delete " + name, bg=C_BTN, fg=_c("#ff7b72"),
+            size_hint_x=None, width=dp(44),
+        )
         delete_button.bind(on_release=partial(self.confirm_delete, name, path))
         row.add_widget(open_button)
         row.add_widget(delete_button)
