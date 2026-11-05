@@ -1,7 +1,11 @@
 
 [app]
 
-title = Android Python IDE
+title = Elyx
+
+# ELYX branding assets
+icon.filename = %(source.dir)s/elyx_android_brand_assets/elyx_icon.png
+presplash.filename = %(source.dir)s/elyx_android_brand_assets/elyx_splash.png
 package.name = androidpythonide
 package.domain = org.akilesh
 
