@@ -13,13 +13,15 @@ import sys
 import threading
 import time
 import traceback
+import io
+import tokenize
 from functools import partial
 
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import Color, Ellipse, Line, Rectangle, Triangle
+from kivy.graphics import Color, Ellipse, Line, Rectangle
 from kivy.graphics.instructions import InstructionGroup
 from kivy.metrics import dp, sp
 from kivy.resources import resource_find
@@ -32,6 +34,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.splitter import Splitter
 from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
@@ -266,33 +269,40 @@ class FlatButton(Button):
 
 
 class IconButton(FlatButton):
-    """Flat button with a small vector icon, optionally followed by a label."""
+    """Flat button with a light-weight vector icon and optional clear label."""
 
     def __init__(self, icon, label=None, **kwargs):
         text = kwargs.pop("text", "")
         if text:
+            # Reserve a distinct icon gutter so the icon never sits on top of
+            # the label, including on narrow Android popup rows.
             kwargs.setdefault("halign", "left")
-            kwargs.setdefault("padding", [dp(40), 0])
+            kwargs.setdefault("padding", [dp(42), 0])
         super().__init__(text=text, **kwargs)
         self.icon = icon
         # Kept as descriptive metadata for future accessibility integration.
         self.accessibility_label = label or text or icon.replace("-", " ").title()
         self.bind(pos=self._draw_icon, size=self._draw_icon,
-                  disabled=self._draw_icon, color=self._draw_icon)
+                  disabled=self._draw_icon, color=self._draw_icon,
+                  padding=self._draw_icon)
         self._draw_icon()
 
     def _draw_icon(self, *args):
         self.canvas.after.clear()
-        cx = self.x + dp(19) if self.text else self.center_x
+        # Labelled buttons have a fixed icon gutter; icon-only buttons are
+        # always centered in their available area.
+        cx = self.x + dp(18) if self.text else self.center_x
         cy = self.center_y
-        size = min(self.height * 0.30, dp(10))
+        size = min(self.height * 0.28, dp(9))
         if size <= 0:
             return
         left, right = cx - size, cx + size
         bottom, top = cy - size, cy + size
         alpha = 0.38 if self.disabled else 1.0
         rgb = self.color[:3]
-        weight = max(1.15, dp(1.55))
+        # Keep vector strokes crisp but noticeably lighter on high-density
+        # Android screens. Every icon branch below inherits this base width.
+        weight = max(0.75, dp(1.0))
 
         def stroke(points, close=False, width=weight):
             Line(points=points, close=close, width=width)
@@ -308,12 +318,21 @@ class IconButton(FlatButton):
                 for y in (cy + size * 0.65, cy, cy - size * 0.65):
                     stroke([cx - size, y, cx + size, y], width=weight * 1.2)
             elif icon == "play":
-                Triangle(points=[cx - size * 0.65, cy - size,
-                                 cx - size * 0.65, cy + size,
-                                 cx + size, cy])
+                # Slim outlined play mark: smaller visual footprint and no
+                # heavy filled triangle competing with the toolbar.
+                stroke([cx - size * 0.62, cy - size * 0.82,
+                        cx - size * 0.62, cy + size * 0.82,
+                        cx + size * 0.78, cy,
+                        cx - size * 0.62, cy - size * 0.82],
+                       width=weight * 1.15)
             elif icon == "stop":
-                filled_rect(cx - size * 0.72, cy - size * 0.72,
-                            size * 1.44, size * 1.44)
+                # Compact outlined stop square to match the light play mark.
+                box = size * 0.62
+                stroke([cx - box, cy - box,
+                        cx - box, cy + box,
+                        cx + box, cy + box,
+                        cx + box, cy - box],
+                       close=True, width=weight * 1.15)
             elif icon in ("folder", "folder-open", "folder-plus"):
                 if icon == "folder-open":
                     stroke([left, cy + size * 0.35,
@@ -917,6 +936,123 @@ class SmartCodeInput(CodeInput):
         return True
 
 
+class BracketMatcher:
+    """Highlight the bracket pair nearest the editor cursor.
+
+    Python tokenization keeps brackets inside strings and comments from being
+    treated as structural delimiters. The highlight is drawn behind the text
+    and follows the editor's scroll position.
+    """
+
+    OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+    CLOSE_TO_OPEN = {value: key for key, value in OPEN_TO_CLOSE.items()}
+
+    def __init__(self, editor, backdrop):
+        self.editor = editor
+        self.group = InstructionGroup()
+        backdrop.canvas.before.add(self.group)
+        self._trigger = Clock.create_trigger(self.redraw, 0)
+        editor.bind(
+            text=self.schedule,
+            cursor=self.schedule,
+            scroll_x=self.schedule,
+            scroll_y=self.schedule,
+            pos=self.schedule,
+            size=self.schedule,
+            padding=self.schedule,
+            font_size=self.schedule,
+        )
+        self.schedule()
+
+    def schedule(self, *args):
+        self._trigger()
+
+    def _bracket_tokens(self, source):
+        tokens = []
+        try:
+            stream = tokenize.generate_tokens(io.StringIO(source).readline)
+            for item in stream:
+                if item.type == tokenize.OP and item.string in "()[]{}":
+                    tokens.append((item.string, item.start, item.end))
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            # Incomplete code is normal while editing. Keep tokens emitted
+            # before the tokenizer reached the incomplete section.
+            pass
+        return tokens
+
+    def _matching_positions(self, source, cursor):
+        tokens = self._bracket_tokens(source)
+        stack = []
+        pairs = {}
+        for index, (char, start, _end) in enumerate(tokens):
+            if char in self.OPEN_TO_CLOSE:
+                stack.append(index)
+            elif char in self.CLOSE_TO_OPEN:
+                if stack and tokens[stack[-1]][0] == self.CLOSE_TO_OPEN[char]:
+                    opening = stack.pop()
+                    pairs[opening] = index
+                    pairs[index] = opening
+
+        row, col = cursor[1], cursor[0]
+        active = None
+        # Prefer the character immediately before the insertion point, then
+        # the character immediately after it.
+        for index, (_char, start, end) in enumerate(tokens):
+            if end == (row + 1, col):
+                active = index
+                break
+        if active is None:
+            for index, (_char, start, _end) in enumerate(tokens):
+                if start == (row + 1, col):
+                    active = index
+                    break
+        if active is None:
+            return []
+        other = pairs.get(active)
+        result = [tokens[active]]
+        if other is not None:
+            result.append(tokens[other])
+        return result
+
+    @staticmethod
+    def _visual_column(line, column, tab_width):
+        prefix = line[:column]
+        return len(prefix.expandtabs(tab_width))
+
+    def redraw(self, *args):
+        ed = self.editor
+        self.group.clear()
+        if not ed.text or ed.width <= 0 or ed.height <= 0:
+            return
+        positions = self._matching_positions(ed.text, ed.cursor)
+        if not positions:
+            return
+
+        dy = ed.line_height + ed.line_spacing
+        char_width = getattr(ed, "ide_char_w", 0)
+        if dy <= 0 or char_width <= 0:
+            return
+
+        lines = ed.text.split("\n")
+        tab_width = max(1, int(getattr(ed, "tab_width", 4) or 4))
+        top0 = ed.top - ed.padding[1] + ed.scroll_y
+        self.group.add(Color(C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.28))
+        for _char, start, _end in positions:
+            row, col = start
+            line_index = row - 1
+            if not (0 <= line_index < len(lines)):
+                continue
+            visual_col = self._visual_column(lines[line_index], col, tab_width)
+            x = ed.x + ed.padding[0] + visual_col * char_width - ed.scroll_x
+            y = top0 - row * dy
+            if x + char_width < ed.x or x > ed.right or y + dy < ed.y or y > ed.top:
+                continue
+            self.group.add(Rectangle(
+                pos=(x, y + dp(1)),
+                size=(char_width, max(dp(1), dy - dp(2))),
+            ))
+
+
 class IndentationGuides:
     """Draw subtle vertical guides for active Python indentation blocks.
 
@@ -1031,20 +1167,21 @@ class LineNumberGutter(StencilView):
     """
 
     def __init__(self, editor, backdrop, **kwargs):
-        super().__init__(size_hint_x=None, width=dp(36), **kwargs)
+        super().__init__(size_hint_x=None, width=dp(42), **kwargs)
         self.editor = editor
         self._textures = {}
         self._digits = 2
         self._total = editor.text.count("\n") + 1
         self._digit_width = self._render("0").width
 
-        self.width = self._digit_width * self._digits + dp(12)
+        self.width = self._digit_width * self._digits + dp(18)
 
-        # The highlight is drawn on the backdrop, behind the transparent
-        # editor. (Drawing it inside the editor's own canvas would override
-        # the colour TextInput uses for its text and make the text faint.)
+        # A low-contrast accent wash marks the active row across the editor.
+        # It lives on the backdrop so it never tints the syntax-highlighted text.
         with backdrop.canvas.before:
-            self._hl_color = Color(1, 1, 1, 0.05)
+            self._hl_color = Color(
+                C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.055
+            )
             self._hl_rect = Rectangle(pos=(0, 0), size=(0, 0))
             Color(1, 1, 1, 1)
 
@@ -1090,7 +1227,7 @@ class LineNumberGutter(StencilView):
         digits = max(2, len(str(total)))
         if digits != self._digits:
             self._digits = digits
-            self.width = self._digit_width * digits + dp(12)
+            self.width = self._digit_width * digits + dp(18)
 
         pad_top = ed.padding[1]
         top0 = ed.top - pad_top + ed.scroll_y  # top edge of the first line
@@ -1117,10 +1254,20 @@ class LineNumberGutter(StencilView):
             for number in range(first, last + 1):
                 row_bottom = top0 - (number + 1) * dy
                 texture = self._texture(number + 1)
-                Color(*(C_TEXT if number == current else C_MUTED))
+                if number == current:
+                    # A slim accent marker and brighter numeral make the
+                    # active row easy to track without a heavy gutter.
+                    Color(C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.9)
+                    Rectangle(
+                        pos=(self.x + dp(2), row_bottom + dp(2)),
+                        size=(dp(2), max(dp(2), dy - dp(4))),
+                    )
+                    Color(*C_TEXT)
+                else:
+                    Color(*C_MUTED)
                 Rectangle(
                     texture=texture,
-                    pos=(self.right - dp(6) - texture.width,
+                    pos=(self.right - dp(8) - texture.width,
                          row_bottom + (dy - texture.height) / 2),
                     size=texture.size,
                 )
@@ -1260,33 +1407,40 @@ class PythonIDE(App):
         return root
 
     def build_app_bar(self):
-        # A slimmer toolbar leaves more vertical room for the code editor.
-        bar = BoxLayout(size_hint_y=None, height=dp(40),
-                        padding=[dp(8), dp(3), dp(6), dp(3)], spacing=dp(6))
+        # Compact toolbar with clearly separated icon-only action controls.
+        bar = BoxLayout(size_hint_y=None, height=dp(42),
+                        padding=[dp(8), dp(3), dp(8), dp(3)], spacing=dp(5))
         paint(bar, C_BAR)
 
         # Reserved hamburger placeholder for a future navigation menu.
         # It intentionally has no callback or menu actions yet.
         self.menu_button = IconButton(
             "menu", label="Menu", bg=C_BTN, size_hint_x=None,
-            width=dp(38),
+            width=dp(40),
         )
         bar.add_widget(self.menu_button)
 
         self.tab_label = make_label(size=13, markup=True, bold=True)
         bar.add_widget(self.tab_label)
 
+        # The File control is icon-only so its folder glyph cannot collide
+        # with a text label on compact phone layouts.
         self.file_button = IconButton(
-            "folder", text="FILE", label="File actions", bg=C_BTN,
-            size_hint_x=None, width=dp(68), font_size=sp(11),
-            padding=[dp(34), 0],
+            "folder", label="File actions", bg=C_BTN,
+            size_hint_x=None, width=dp(42),
         )
         self.file_button.bind(on_release=self.show_file_menu)
-        self.run_button = IconButton("play", bg=C_RUN, size_hint_x=None,
-                                     width=dp(48))
+
+        # Run and Stop use matching, thin outline glyphs with no overlaid text.
+        self.run_button = IconButton(
+            "play", label="Run code", bg=C_RUN, size_hint_x=None,
+            width=dp(48),
+        )
         self.run_button.bind(on_release=self.run_code)
-        self.stop_button = IconButton("stop", bg=C_STOP, size_hint_x=None,
-                                      width=dp(48), disabled=True)
+        self.stop_button = IconButton(
+            "stop", label="Stop code", bg=C_STOP, size_hint_x=None,
+            width=dp(48), disabled=True,
+        )
         self.stop_button.bind(on_release=self.stop_code)
         bar.add_widget(self.file_button)
         bar.add_widget(self.run_button)
@@ -1359,7 +1513,8 @@ class PythonIDE(App):
             multiline=True,
             auto_indent=False,
             unfocus_on_touch=False,  # keep the keyboard up while using the symbol bar
-            font_size=sp(15),
+            font_size=sp(15.5),
+            line_spacing=dp(2),
             font_name=MONO_FONT,
             foreground_color=C_TEXT,          # default colour for unstyled tokens
             background_color=(0, 0, 0, 0),    # transparent: the area paints C_BG
@@ -1367,7 +1522,7 @@ class PythonIDE(App):
             background_active="",
             cursor_color=C_ACCENT,
             selection_color=(0.74, 0.58, 0.98, 0.35),
-            padding=[dp(6), dp(8), dp(8), dp(8)],
+            padding=[dp(10), dp(10), dp(12), dp(10)],
             lexer=PythonLexer(),
             style_name=pick_style(),
             tab_width=4,
@@ -1376,37 +1531,62 @@ class PythonIDE(App):
 
         self.indent_guides = IndentationGuides(self.editor, area)
         self.gutter = LineNumberGutter(self.editor, area)
+        self.bracket_matcher = BracketMatcher(self.editor, area)
         area.add_widget(self.gutter)
         area.add_widget(self.editor)
         return area
 
     def build_console(self):
+        """Build the redesigned output console without changing its I/O flow."""
         self.console = Splitter(
             sizable_from="top",
             size_hint_y=None,
-            height=dp(210),
-            min_size=dp(90),
+            height=dp(224),
+            min_size=dp(96),
             max_size=dp(560),
             strip_size=dp(14),
             keep_within_parent=True,
         )
-        content = BoxLayout(orientation="vertical")
+        content = BoxLayout(orientation="vertical", spacing=0)
         paint(content, C_PANEL)
 
-        header = BoxLayout(size_hint_y=None, height=dp(30),
-                           padding=[dp(12), 0, dp(4), 0])
+        # Compact terminal header: clear title hierarchy and a separate
+        # icon-only clear action. The existing clear_output handler is kept.
+        header = BoxLayout(
+            size_hint_y=None, height=dp(42),
+            padding=[dp(12), dp(2), dp(6), dp(2)], spacing=dp(9),
+        )
         paint(header, C_BAR)
-        header.add_widget(make_label("OUTPUT", size=11, color=C_MUTED, bold=True))
+        terminal_mark = make_label("›_", size=17, color=C_ACCENT,
+                                   bold=True, size_hint_x=None, width=dp(25))
+        header.add_widget(terminal_mark)
+
+        title_stack = BoxLayout(orientation="vertical", spacing=0)
+        title_stack.add_widget(make_label(
+            "TERMINAL", size=11, color=C_TEXT, bold=True,
+        ))
+        title_stack.add_widget(make_label(
+            "Program output", size=9, color=C_MUTED,
+        ))
+        header.add_widget(title_stack)
+        header.add_widget(Widget())
+
         clear_button = IconButton(
             "trash", label="Clear output", bg=C_BAR, fg=C_MUTED,
-            size_hint_x=None, width=dp(42),
+            size_hint=(None, None), size=(dp(38), dp(34)),
         )
         clear_button.bind(on_release=self.clear_output)
         header.add_widget(clear_button)
         content.add_widget(header)
+        content.add_widget(divider())
 
-        self.scroll = ScrollView(do_scroll_x=False, do_scroll_y=True,
-                                 bar_width=dp(4), scroll_type=["bars", "content"])
+        # Keep the existing ScrollView and output buffer callbacks intact.
+        output_area = BoxLayout(orientation="vertical", padding=[dp(2), dp(3)])
+        paint(output_area, C_PANEL)
+        self.scroll = ScrollView(
+            do_scroll_x=False, do_scroll_y=True,
+            bar_width=dp(3), scroll_type=["bars", "content"],
+        )
         self.output_label = Label(
             text="Ready. Tap the green button to run your code.",
             size_hint_y=None,
@@ -1420,12 +1600,15 @@ class PythonIDE(App):
         self.output_label.bind(width=self.update_output_width,
                                texture_size=self.update_output_height)
         self.scroll.add_widget(self.output_label)
-        content.add_widget(self.scroll)
+        output_area.add_widget(self.scroll)
+        content.add_widget(output_area)
 
-        # Shown only while the program is waiting for input().
-        self.input_panel = BoxLayout(size_hint_y=None, height=0, opacity=0,
-                                     disabled=True,
-                                     padding=[dp(6), dp(4)], spacing=dp(6))
+        # Shown only while the program is waiting for input(). Keep the same
+        # input field, queue submission and visibility behavior.
+        self.input_panel = BoxLayout(
+            size_hint_y=None, height=0, opacity=0, disabled=True,
+            padding=[dp(8), dp(6)], spacing=dp(7),
+        )
         paint(self.input_panel, C_BAR)
         self.input_field = TextInput(
             hint_text="Type input and press Enter",
@@ -1437,7 +1620,7 @@ class PythonIDE(App):
         self.input_field.bind(on_text_validate=self.submit_input)
         send_button = IconButton(
             "send", label="Send input", bg=C_PRIMARY,
-            size_hint_x=None, width=dp(44),
+            size_hint=(None, None), size=(dp(42), dp(38)),
         )
         send_button.bind(on_release=self.submit_input)
         self.input_panel.add_widget(self.input_field)
@@ -2674,7 +2857,7 @@ class PythonIDE(App):
         return path
 
     def show_project_explorer(self, directory=None):
-        """Render the current folder; directory navigation stays within workspace."""
+        """Render a polished project explorer without changing file actions."""
         root = self._explorer_root()
         try:
             os.makedirs(root, exist_ok=True)
@@ -2689,70 +2872,16 @@ class PythonIDE(App):
 
         self._explorer_current_dir = current
         relative = os.path.relpath(current, root)
-        if relative == ".":
-            relative_label = "/"
-        else:
-            relative_label = "/" + relative.replace(os.sep, "/")
+        relative_label = "/" if relative == "." else (
+            "/" + relative.replace(os.sep, "/")
+        )
 
-        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(7))
-        path_label = make_label(
-            "PROJECT  " + escape_markup(relative_label), size=12,
-            color=C_ACCENT, size_hint_y=None, height=dp(30),
-            markup=True,
-        )
-        content.add_widget(path_label)
-
-        toolbar = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(5))
-        parent = os.path.dirname(current)
-        up_button = IconButton(
-            "arrow-up", label="Go to parent folder", bg=C_BTN,
-            size_hint_x=None, width=dp(44), disabled=(current == root),
-        )
-        up_button.bind(on_release=lambda *_: self.show_project_explorer(parent))
-        folder_button = IconButton(
-            "folder-plus", text="New folder", bg=C_BTN,
-            padding=[dp(38), 0],
-        )
-        folder_button.bind(
-            on_release=lambda *_: self._prompt_explorer_name(
-                "New folder", "", partial(self._create_explorer_folder, current),
-                "Folder name", return_directory=current,
-            )
-        )
-        file_button = IconButton(
-            "file-plus", text="New Python file", bg=C_BTN,
-            padding=[dp(38), 0],
-        )
-        file_button.bind(on_release=lambda *_: self._begin_explorer_new_file(current))
-        refresh_button = IconButton(
-            "refresh", label="Refresh folder", bg=C_BTN,
-            size_hint_x=None, width=dp(44),
-        )
-        refresh_button.bind(on_release=lambda *_: self.show_project_explorer(current))
-        for button in (up_button, folder_button, file_button, refresh_button):
-            toolbar.add_widget(button)
-        content.add_widget(toolbar)
-
-        note = make_label(
-            "Local copy · normal Sync adds/updates; Sync + delete mirrors renames/deletions",
-            size=10, color=C_MUTED, size_hint_y=None, height=dp(30),
-        )
-        content.add_widget(note)
-
-        scroll = ScrollView(do_scroll_x=False, do_scroll_y=True,
-                            bar_width=dp(4), scroll_type=["bars", "content"])
-        entries_box = BoxLayout(
-            orientation="vertical", size_hint_y=None, spacing=dp(3),
-            padding=[0, dp(2), 0, dp(4)],
-        )
-        entries_box.bind(minimum_height=entries_box.setter("height"))
-
+        # Collect entries with the same safety and ordering rules as before:
+        # symlinks are skipped, folders come first, then names sort naturally.
         entries = []
         try:
             with os.scandir(current) as iterator:
                 for entry in iterator:
-                    # Do not follow symlinks: they may point outside the project
-                    # or create directory cycles in the explorer.
                     if entry.is_symlink():
                         continue
                     try:
@@ -2767,14 +2896,120 @@ class PythonIDE(App):
         except OSError as exc:
             self.show_message("Could not read folder", str(exc))
             return
-
         entries.sort(key=lambda item: (item[0], item[1].casefold()))
+
+        folder_count = sum(1 for item in entries if item[0] == 0)
+        file_count = len(entries) - folder_count
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(11), dp(9), dp(11), dp(9)],
+            spacing=dp(7),
+        )
+
+        # Current-location card gives the path a clear hierarchy and keeps
+        # long project paths readable on narrow phone screens.
+        location = BoxLayout(
+            orientation="vertical", size_hint_y=None, height=dp(54),
+            padding=[dp(10), dp(4)], spacing=dp(1),
+        )
+        paint(location, C_BAR)
+        location.add_widget(make_label(
+            "CURRENT LOCATION", size=9, color=C_ACCENT, bold=True,
+            size_hint_y=None, height=dp(16),
+        ))
+        location.add_widget(make_label(
+            escape_markup(relative_label), size=12, color=C_TEXT,
+            markup=True,
+        ))
+        content.add_widget(location)
+
+        # Keep every existing explorer action and callback. Flexible text
+        # buttons make the toolbar fit compact Android display widths.
+        toolbar = BoxLayout(
+            size_hint_y=None, height=dp(42), spacing=dp(5),
+        )
+        parent = os.path.dirname(current)
+        up_button = IconButton(
+            "arrow-up", label="Go to parent folder", bg=C_BTN,
+            size_hint_x=None, width=dp(40), disabled=(current == root),
+        )
+        up_button.bind(on_release=lambda *_: self.show_project_explorer(parent))
+
+        folder_button = IconButton(
+            "folder-plus", text="New folder", label="Create new folder",
+            bg=C_BTN, font_size=sp(11), padding=[dp(35), 0],
+        )
+        folder_button.bind(
+            on_release=lambda *_: self._prompt_explorer_name(
+                "New folder", "", partial(self._create_explorer_folder, current),
+                "Folder name", return_directory=current,
+            )
+        )
+        file_button = IconButton(
+            "file-plus", text="New Python file", label="Create new Python file",
+            bg=C_BTN, font_size=sp(11), padding=[dp(35), 0],
+        )
+        file_button.bind(
+            on_release=lambda *_: self._begin_explorer_new_file(current)
+        )
+        refresh_button = IconButton(
+            "refresh", label="Refresh folder", bg=C_BTN,
+            size_hint_x=None, width=dp(40),
+        )
+        refresh_button.bind(
+            on_release=lambda *_: self.show_project_explorer(current)
+        )
+        for button in (up_button, folder_button, file_button, refresh_button):
+            toolbar.add_widget(button)
+        content.add_widget(toolbar)
+
+        # Retain the important local-copy/synchronization warning, but present
+        # it as quiet supporting information instead of a full-width text row.
+        sync_note = make_label(
+            "LOCAL COPY  ·  Sync adds/updates; Sync + delete also mirrors removals",
+            size=9, color=C_MUTED, halign="left", valign="middle",
+            size_hint_y=None, height=dp(26),
+        )
+        content.add_widget(sync_note)
+
+        list_header = BoxLayout(
+            size_hint_y=None, height=dp(22), spacing=dp(5),
+        )
+        list_header.add_widget(make_label(
+            "PROJECT ITEMS", size=10, color=C_TEXT, bold=True,
+        ))
+        list_header.add_widget(Widget())
+        list_header.add_widget(make_label(
+            "%d folders  ·  %d files" % (folder_count, file_count),
+            size=9, color=C_MUTED, halign="right",
+        ))
+        content.add_widget(list_header)
+        content.add_widget(divider())
+
+        scroll = ScrollView(
+            do_scroll_x=False, do_scroll_y=True,
+            bar_width=dp(3), scroll_type=["bars", "content"],
+        )
+        entries_box = BoxLayout(
+            orientation="vertical", size_hint_y=None, spacing=dp(5),
+            padding=[0, dp(3), dp(1), dp(5)],
+        )
+        entries_box.bind(minimum_height=entries_box.setter("height"))
+
         if not entries:
-            entries_box.add_widget(make_label(
-                "This folder is empty.\nCreate a folder or Python file to get started.",
-                size=13, color=C_MUTED, halign="center", size_hint_y=None,
-                height=dp(100),
+            empty_state = BoxLayout(
+                orientation="vertical", size_hint_y=None,
+                height=dp(112), padding=[dp(8), dp(12)], spacing=dp(5),
+            )
+            empty_state.add_widget(make_label(
+                "Nothing here yet", size=14, color=C_TEXT, bold=True,
+                halign="center", size_hint_y=None, height=dp(28),
             ))
+            empty_state.add_widget(make_label(
+                "Create a folder or Python file to get started.",
+                size=11, color=C_MUTED, halign="center",
+            ))
+            entries_box.add_widget(empty_state)
         else:
             for kind, name, path, size, mtime in entries:
                 entries_box.add_widget(self.make_explorer_row(
@@ -2784,8 +3019,9 @@ class PythonIDE(App):
         content.add_widget(scroll)
 
         close = IconButton(
-            "x", label="Close", bg=C_BAR,
-            size_hint_x=None, width=dp(44), size_hint_y=None, height=dp(42),
+            "x", text="Close explorer", label="Close project explorer",
+            bg=C_BAR, size_hint_y=None, height=dp(40),
+            font_size=sp(11), padding=[dp(38), 0],
         )
         content.add_widget(close)
         title = "Project Explorer"
@@ -2797,26 +3033,37 @@ class PythonIDE(App):
         return popup
 
     def make_explorer_row(self, kind, name, path, size, mtime, current_dir):
-        row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(4))
+        """Build one explorer item with a large open target and clear actions."""
+        row = BoxLayout(
+            size_hint_y=None, height=dp(62), spacing=dp(5),
+            padding=[dp(1), dp(1)],
+        )
+        paint(row, C_PANEL)
+
+        safe_name = escape_markup(name)
         if kind == 0:
-            title = "▸  " + escape_markup(name)
-            detail = "Folder"
+            detail = "Folder  ·  Tap to open"
+            icon_name = "folder-open"
+            icon_color = C_ACCENT
         else:
-            title = "    " + escape_markup(name)
-            extension = os.path.splitext(name)[1].lower() or "File"
-            detail = "%s · %s" % (format_size(size), extension)
-        label = "%s\n[size=%d][color=8b93b5]%s[/color][/size]" % (
-            title, int(sp(10)), escape_markup(detail)
+            extension = os.path.splitext(name)[1].lower() or "file"
+            detail = "%s  ·  %s" % (format_size(size), extension.upper())
+            icon_name = "file-code" if extension == ".py" else "file"
+            icon_color = _c("#8be9fd") if extension == ".py" else C_MUTED
+
+        label = "[b]%s[/b]\n[size=%d][color=8b93b5]%s[/color][/size]" % (
+            safe_name, int(sp(10)), escape_markup(detail)
         )
         open_button = IconButton(
-            "folder-open" if kind == 0 else "file-code",
-            text=label, label="Open " + ("folder " if kind == 0 else "file ") + name,
-            bg=C_BTN, markup=True, halign="left", valign="middle",
-            font_size=sp(13), padding=[dp(42), 0],
+            icon_name, text=label,
+            label="Open " + ("folder " if kind == 0 else "file ") + name,
+            bg=C_BTN, fg=icon_color, markup=True,
+            halign="left", valign="middle", font_size=sp(13),
+            padding=[dp(43), 0],
         )
         open_button.bind(
             size=lambda widget, value: setattr(
-                widget, "text_size", (max(0, value[0] - dp(48)), value[1])
+                widget, "text_size", (max(0, value[0] - dp(51)), value[1])
             )
         )
         if kind == 0:
@@ -2828,14 +3075,15 @@ class PythonIDE(App):
 
         rename_button = IconButton(
             "pencil", label="Rename " + name, bg=C_BTN,
-            size_hint_x=None, width=dp(42),
+            size_hint_x=None, width=dp(38),
         )
         rename_button.bind(on_release=partial(self._explorer_rename_item, path))
         delete_button = IconButton(
             "trash", label="Delete " + name, bg=C_BTN,
-            fg=_c("#ff7b72"), size_hint_x=None, width=dp(42),
+            fg=_c("#ff7b72"), size_hint_x=None, width=dp(38),
         )
         delete_button.bind(on_release=partial(self._explorer_confirm_delete, path))
+
         row.add_widget(open_button)
         row.add_widget(rename_button)
         row.add_widget(delete_button)
