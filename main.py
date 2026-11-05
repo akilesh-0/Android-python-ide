@@ -31,6 +31,7 @@ from kivy.uix.codeinput import CodeInput
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.screenmanager import NoTransition, Screen, ScreenManager
 from kivy.uix.splitter import Splitter
 from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
@@ -39,6 +40,8 @@ from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
 from android_storage import AndroidStorageBridge, StorageBridgeError
+from turtle_engine import TurtleCommandBridge, TurtleCore, TurtleRuntime, turtle_module_context
+from turtle_engine.turtle_preview import TurtlePreviewScreen, code_uses_turtle
 
 # ----------------------------------------------------------------------
 # Settings
@@ -1457,6 +1460,15 @@ class PythonIDE(App):
         self._android_file_picker_bound = False
         self._android_file_picker_request = 4107
 
+        # Turtle preview state. The command bridge is shared with the Python
+        # worker, while its renderer and screen are created only on the UI thread.
+        self._turtle_bridge = None
+        self._turtle_session_id = None
+        self._run_turtle_session_id = None
+        self._turtle_preview_screen = None
+        self._active_turtle_runtime = None
+        self._interactive_turtle_runtime = None
+
         # Route print()/stderr from the running program to the console.
         self._orig_stdout = sys.stdout
         self._orig_stderr = sys.stderr
@@ -1495,7 +1507,14 @@ class PythonIDE(App):
         self.update_tab()
         self.update_cursor()
         Clock.schedule_once(self.update_suggestions, 0)
-        return root
+
+        # Keep the existing editor layout intact as the first screen. The
+        # Turtle workspace is added lazily when it is first opened or run.
+        self.editor_screen = Screen(name="editor")
+        self.editor_screen.add_widget(root)
+        self.screen_manager = ScreenManager(transition=NoTransition())
+        self.screen_manager.add_widget(self.editor_screen)
+        return self.screen_manager
 
     def build_app_bar(self):
         # Compact toolbar with clearly separated icon-only action controls.
@@ -1533,9 +1552,18 @@ class PythonIDE(App):
             width=dp(48), disabled=True,
         )
         self.stop_button.bind(on_release=self.stop_code)
+        self.turtle_button = FlatButton(
+            text="Turtle",
+            bg=C_PRIMARY,
+            size_hint_x=None,
+            width=dp(58),
+            font_size=sp(11),
+        )
+        self.turtle_button.bind(on_release=self.open_turtle_preview)
         bar.add_widget(self.file_button)
         bar.add_widget(self.run_button)
         bar.add_widget(self.stop_button)
+        bar.add_widget(self.turtle_button)
         return bar
 
     def build_file_tabs(self):
@@ -1759,6 +1787,14 @@ class PythonIDE(App):
 
     def on_stop(self):
         self.close_game_screen()
+        self._close_turtle_runtimes()
+        if self._turtle_bridge is not None and self._turtle_session_id is not None:
+            self._turtle_bridge.cancel_session(self._turtle_session_id)
+        if self._turtle_preview_screen is not None:
+            try:
+                self._turtle_preview_screen.dispose()
+            except Exception:
+                pass
         self.save_session()
         self.stop_capture()
         if getattr(self, "storage_bridge", None) is not None:
@@ -1783,6 +1819,10 @@ class PythonIDE(App):
         game = sys.modules.get("pygame_host")
         if game is not None and game.is_open():
             game.request_close()
+            return True
+        if (getattr(self, "screen_manager", None) is not None
+                and self.screen_manager.current == "turtle"):
+            self.close_turtle_preview()
             return True
         if self.popup is not None:
             self.close_popup()
@@ -3842,6 +3882,110 @@ class PythonIDE(App):
         Clock.schedule_once(editor.ensure_soft_keyboard, 0.12)
 
     # ------------------------------------------------------------------
+    # Turtle preview integration
+    # ------------------------------------------------------------------
+    def _ensure_turtle_bridge(self):
+        if self._turtle_bridge is None:
+            self._turtle_bridge = TurtleCommandBridge()
+        return self._turtle_bridge
+
+    def _close_turtle_runtimes(self):
+        runtimes = (self._active_turtle_runtime, self._interactive_turtle_runtime)
+        seen = set()
+        for runtime in runtimes:
+            if runtime is not None and id(runtime) not in seen:
+                seen.add(id(runtime))
+                try:
+                    runtime.close()
+                except Exception:
+                    pass
+        self._active_turtle_runtime = None
+        self._interactive_turtle_runtime = None
+        if self._turtle_preview_screen is not None:
+            try:
+                self._turtle_preview_screen.renderer.set_event_dispatcher(None, None)
+                self._turtle_preview_screen.renderer.set_keyboard_listening(False)
+            except Exception:
+                pass
+
+    def _attach_turtle_runtime(self, runtime, _dt=0):
+        if runtime is None or self._turtle_preview_screen is None:
+            return
+        if runtime is not self._active_turtle_runtime and runtime is not self._interactive_turtle_runtime:
+            return
+        renderer = self._turtle_preview_screen.renderer
+        renderer.set_event_dispatcher(runtime.dispatch_click, runtime.dispatch_key)
+        renderer.set_keyboard_listening(runtime.wants_keyboard)
+        if getattr(self.screen_manager, "current", "editor") != "turtle":
+            renderer.set_keyboard_active(False)
+
+    def _start_turtle_session(self):
+        bridge = self._ensure_turtle_bridge()
+        self._close_turtle_runtimes()
+        if self._turtle_session_id is not None:
+            bridge.cancel_session(self._turtle_session_id)
+        session_id = bridge.start_session()
+        self._turtle_session_id = session_id
+        if self._turtle_preview_screen is not None:
+            self._turtle_preview_screen.set_session(session_id, clear=True)
+        return session_id
+
+    def _ensure_turtle_preview_screen(self):
+        bridge = self._ensure_turtle_bridge()
+        if self._turtle_session_id is None:
+            self._turtle_session_id = bridge.start_session()
+        if self._turtle_preview_screen is None:
+            self._turtle_preview_screen = TurtlePreviewScreen(
+                bridge,
+                self._turtle_session_id,
+                on_back=self.close_turtle_preview,
+                on_run=lambda: self.run_code(None),
+                on_stop=lambda: self.stop_code(None),
+                on_reset=self.reset_turtle_preview,
+            )
+            self.screen_manager.add_widget(self._turtle_preview_screen)
+        return self._turtle_preview_screen
+
+    def open_turtle_preview(self, *_args):
+        self.editor.focus = False
+        self._ensure_turtle_preview_screen()
+        self.screen_manager.current = "turtle"
+        return True
+
+    def close_turtle_preview(self, *_args):
+        if getattr(self, "screen_manager", None) is not None:
+            self.screen_manager.current = "editor"
+        return True
+
+    def reset_turtle_preview(self, *_args):
+        # Reset invalidates any in-flight producer and callback worker first.
+        if self.worker is not None and self._run_turtle_session_id is not None:
+            self.stop_code(None)
+        self._close_turtle_runtimes()
+        bridge = self._ensure_turtle_bridge()
+        if self._turtle_session_id is not None:
+            bridge.cancel_session(self._turtle_session_id)
+        session_id = bridge.start_session()
+        self._turtle_session_id = session_id
+        screen = self._ensure_turtle_preview_screen()
+        screen.set_session(session_id, clear=True)
+        screen.set_running(self.worker is not None)
+        screen.set_status("Ready" if self.worker is None else "Stopping")
+        return True
+
+    def _cancel_active_turtle_run(self):
+        session_id = self._run_turtle_session_id
+        self._close_turtle_runtimes()
+        if session_id is None:
+            return
+        if self._turtle_bridge is not None:
+            self._turtle_bridge.cancel_session(session_id)
+        if self._turtle_preview_screen is not None:
+            self._turtle_preview_screen.renderer.cancel_pending()
+            self._turtle_preview_screen.set_status("Stopped")
+        self._run_turtle_session_id = None
+
+    # ------------------------------------------------------------------
     # Running and stopping code
     # ------------------------------------------------------------------
     def run_code(self, instance):
@@ -3862,6 +4006,23 @@ class PythonIDE(App):
             self.flash("Nothing to run.")
             return
 
+        turtle_session_id = None
+        if code_uses_turtle(code):
+            turtle_session_id = self._start_turtle_session()
+            self._ensure_turtle_preview_screen()
+            self.screen_manager.current = "turtle"
+        else:
+            # A normal Python run ends any previous Turtle event session so
+            # callbacks cannot continue publishing into a hidden preview.
+            if self._interactive_turtle_runtime is not None or self._turtle_session_id is not None:
+                self._close_turtle_runtimes()
+                if self._turtle_bridge is not None and self._turtle_session_id is not None:
+                    self._turtle_bridge.cancel_session(self._turtle_session_id)
+                self._turtle_session_id = None
+            if self.screen_manager.current == "turtle":
+                self.screen_manager.current = "editor"
+
+        self._run_turtle_session_id = turtle_session_id
         self.editor.focus = False  # hide the keyboard so the console is visible
         self.clear_output()
         self.purge_workspace_modules()
@@ -3891,10 +4052,14 @@ class PythonIDE(App):
 
         thread = threading.Thread(
             target=self.execute_code,
-            args=(code, name, file_path, run_root),
+            args=(code, name, file_path, run_root, turtle_session_id),
             daemon=True,
         )
         self.worker = thread
+        if self._turtle_preview_screen is not None:
+            self._turtle_preview_screen.set_running(True)
+            if turtle_session_id is not None:
+                self._turtle_preview_screen.set_status("Running")
         thread.start()
 
     def setup_pygame(self):
@@ -3937,6 +4102,7 @@ class PythonIDE(App):
 
         self.stop_requested = True
         self.set_state("Stopping... tap stop again to force")
+        self._cancel_active_turtle_run()
         self.input_queue.put(_STOP)       # wakes a blocked input()
         raise_in_thread(thread, StopRun)  # interrupts running Python code
 
@@ -3945,7 +4111,8 @@ class PythonIDE(App):
         run_builtins["input"] = self.request_input
         return run_builtins
 
-    def execute_code(self, code, name, file_path, run_root=None):
+    def execute_code(self, code, name, file_path, run_root=None,
+                     turtle_session_id=None):
         me = threading.current_thread()
         started = time.perf_counter()
         previous_cwd = os.getcwd()
@@ -3966,11 +4133,23 @@ class PythonIDE(App):
             linecache.cache[name] = (len(code), None, code.splitlines(True), name)
 
             compiled = compile(code, name, "exec")
-            exec(compiled, {
+            runtime_globals = {
                 "__name__": "__main__",
                 "__file__": file_path,
                 "__builtins__": self.make_builtins(),
-            })
+            }
+            if turtle_session_id is not None:
+                # Expose an isolated compatibility module only for this Turtle
+                # run. The context restores any pre-existing stdlib module.
+                turtle_runtime = TurtleRuntime(
+                    self._turtle_bridge, turtle_session_id
+                )
+                self._active_turtle_runtime = turtle_runtime
+                Clock.schedule_once(partial(self._attach_turtle_runtime, turtle_runtime), 0)
+                with turtle_module_context(turtle_runtime):
+                    exec(compiled, runtime_globals)
+            else:
+                exec(compiled, runtime_globals)
         except StopRun:
             self.append_output("\n[Stopped]\n")
         except SystemExit:
@@ -4006,7 +4185,26 @@ class PythonIDE(App):
         if thread is not self.worker:
             return
         self.worker = None
+        session_id = self._run_turtle_session_id
+        runtime = self._active_turtle_runtime
+        keep_interactive = bool(runtime is not None and runtime.has_interactions)
+        if keep_interactive:
+            self._interactive_turtle_runtime = runtime
+            self._active_turtle_runtime = None
+        else:
+            if runtime is not None:
+                runtime.close()
+            self._active_turtle_runtime = None
+            if self._turtle_preview_screen is not None:
+                self._turtle_preview_screen.renderer.set_event_dispatcher(None, None)
+                self._turtle_preview_screen.renderer.set_keyboard_listening(False)
+            if session_id is not None and self._turtle_bridge is not None:
+                self._turtle_bridge.finish_session(session_id)
+        self._run_turtle_session_id = None
         self.reset_ui()
+        if keep_interactive and self._turtle_preview_screen is not None:
+            self._turtle_preview_screen.set_status("Interactive")
+            Clock.schedule_once(partial(self._attach_turtle_runtime, runtime), 0)
 
     def stop_capture(self):
         if self.fd_capture is not None:
@@ -4033,6 +4231,10 @@ class PythonIDE(App):
         Clock.schedule_once(self.refresh_display, 0.6)
         self.run_button.disabled = False
         self.stop_button.disabled = True
+        if self._turtle_preview_screen is not None:
+            self._turtle_preview_screen.set_running(False)
+            if self._run_turtle_session_id is None:
+                self._turtle_preview_screen.set_status("Ready")
         self.hide_input_panel()
         self.set_state("Ready")
 
