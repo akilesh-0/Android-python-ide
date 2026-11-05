@@ -119,25 +119,54 @@ _JNI = {}
 
 
 def read_ime_height():
-    """Soft-keyboard height in pixels, read from Android WindowInsets (API 30+).
+    """Return the Android IME inset in physical pixels when available.
 
-    Returns 0 when the keyboard is hidden and None when it can't be measured
-    (not Android, old Android, or the lookup failed).
+    Prefer WindowInsets.Type.ime() on Android 11+, and fall back to the
+    visible-display-frame gap on older Android releases (including Android 10).
+    A small navigation-bar inset is ignored by the caller's visibility threshold.
+    Transient JNI failures are not cached as permanent failures.
     """
-    if platform != "android" or _JNI.get("dead"):
+    if platform != "android":
         return None
     try:
         if "decor" not in _JNI:
             from jnius import autoclass
             activity = autoclass("org.kivy.android.PythonActivity").mActivity
             _JNI["decor"] = activity.getWindow().getDecorView()
-            _JNI["type"] = autoclass("android.view.WindowInsets$Type")
-        insets = _JNI["decor"].getRootWindowInsets()
-        if insets is None:
-            return 0
-        return int(insets.getInsets(_JNI["type"].ime()).bottom)
+            _JNI["Rect"] = autoclass("android.graphics.Rect")
+            try:
+                _JNI["type"] = autoclass("android.view.WindowInsets$Type")
+            except Exception:
+                _JNI["type"] = None
+
+        decor = _JNI["decor"]
+        ime_height = None
+        if _JNI.get("type") is not None:
+            try:
+                insets = decor.getRootWindowInsets()
+                if insets is not None:
+                    ime_height = int(insets.getInsets(_JNI["type"].ime()).bottom)
+            except Exception:
+                ime_height = None
+
+        # This API works on older Android versions where Type.ime() is absent.
+        try:
+            frame = _JNI["Rect"]()
+            decor.getWindowVisibleDisplayFrame(frame)
+            root_height = int(decor.getRootView().getHeight())
+            frame_gap = max(0, root_height - int(frame.bottom))
+            if frame_gap > dp(100):
+                return frame_gap
+        except Exception:
+            pass
+
+        return ime_height if ime_height is not None else None
     except Exception:
-        _JNI["dead"] = True
+        # The Activity/decor can be temporarily unavailable during startup or
+        # resume. Retry on the next poll instead of disabling IME detection.
+        _JNI.pop("decor", None)
+        _JNI.pop("Rect", None)
+        _JNI.pop("type", None)
         return None
 
 
@@ -653,6 +682,7 @@ class SmartCodeInput(CodeInput):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._keyboard_retry_pending = False
         self.ide_rows = 1
         self.ide_cols = 0
         self.ide_vel = [0, 0]
@@ -767,6 +797,27 @@ class SmartCodeInput(CodeInput):
 
         super().insert_text(substring, from_undo=from_undo)
 
+    def ensure_soft_keyboard(self, dt=0):
+        """Retry one Android keyboard request if a tap left the editor focused
+        but Kivy did not acquire a keyboard object.
+        """
+        if platform != "android" or not self.focus or self._keyboard_retry_pending:
+            return
+        try:
+            keyboard = self.keyboard
+        except Exception:
+            keyboard = None
+        if keyboard is not None:
+            return
+
+        self._keyboard_retry_pending = True
+        self.focus = False
+        Clock.schedule_once(self._restore_soft_keyboard_focus, 0.08)
+
+    def _restore_soft_keyboard_focus(self, dt):
+        self.focus = True
+        self._keyboard_retry_pending = False
+
     # -- scrolling -----------------------------------------------------
     def _ide_text_stats(self, instance, value):
         self.ide_rows = value.count("\n") + 1
@@ -840,13 +891,47 @@ class SmartCodeInput(CodeInput):
         return True
 
     def _hold_touch(self, touch, dt):
-        # A stationary long press should select text, not start scrolling.
-        # First let TextInput place the cursor at the finger position, then
-        # select the word on the next frame (focus changes can clear selection).
+        # A stationary long press selects the word nearest the finger. Forward
+        # the original touch to Kivy first so Android selection handles remain
+        # available, then explicitly place the cursor at the touch location.
         if touch.ud.get("ide_mode") == "pending":
             touch.ud["ide_mode"] = "forwarded"
+            touch.ud["ide_hold_pos"] = tuple(touch.pos)
             CodeInput.on_touch_down(self, touch)
-            Clock.schedule_once(lambda _dt: self.select_word_at_cursor(), 0.05)
+            Clock.schedule_once(
+                lambda _dt: self.select_word_at_touch(*touch.ud["ide_hold_pos"]),
+                0.05,
+            )
+
+    def _cursor_index_at_touch(self, x, y):
+        """Translate a screen touch into a safe index in the editor text."""
+        try:
+            col, row = self.get_cursor_from_xy(x, y)
+            lines = self.text.split("\n")
+            row = max(0, min(int(row), len(lines) - 1))
+            col = max(0, min(int(col), len(lines[row])))
+            return sum(len(line) + 1 for line in lines[:row]) + col
+        except Exception:
+            return self.cursor_index()
+
+    def select_word_at_touch(self, x, y):
+        """Place the cursor at a long-press location and select its word."""
+        if not self.text:
+            return False
+        try:
+            index = self._cursor_index_at_touch(x, y)
+            # Set the actual editor cursor before selecting, so the selection
+            # starts where the user pressed rather than at an older cursor.
+            lines = self.text.split("\n")
+            remaining = index
+            row = 0
+            while row < len(lines) - 1 and remaining > len(lines[row]):
+                remaining -= len(lines[row]) + 1
+                row += 1
+            self.cursor = (min(remaining, len(lines[row])), row)
+            return self.select_word_at_cursor()
+        except Exception:
+            return self.select_word_at_cursor()
 
     def select_word_at_cursor(self):
         """Select the identifier/word under the current editor cursor."""
@@ -862,7 +947,8 @@ class SmartCodeInput(CodeInput):
         def is_word_char(char):
             return char == "_" or char.isalnum()
 
-        # A cursor just after a word should select that word, too.
+        # At a word boundary, prefer the character immediately under the
+        # cursor; if the cursor is just after a word, select that word.
         if not is_word_char(text[index]) and index > 0 and is_word_char(text[index - 1]):
             index -= 1
 
@@ -874,7 +960,6 @@ class SmartCodeInput(CodeInput):
             while end < len(text) and is_word_char(text[end]):
                 end += 1
         else:
-            # For punctuation, select the single character under the cursor.
             start, end = index, index + 1
 
         try:
@@ -925,11 +1010,17 @@ class SmartCodeInput(CodeInput):
             hold.cancel()
 
         if mode == "pending":
-            # A quick tap: let TextInput place the cursor and open the keyboard.
+            # A quick tap: let TextInput place the cursor and request the
+            # keyboard. Verify acquisition after Kivy has processed the tap;
+            # this also recovers when Android left focus set but no keyboard.
             CodeInput.on_touch_down(self, touch)
             CodeInput.on_touch_up(self, touch)
+            self.focus = True
+            Clock.schedule_once(self.ensure_soft_keyboard, 0.12)
         elif mode == "forwarded":
             CodeInput.on_touch_up(self, touch)
+            self.focus = True
+            Clock.schedule_once(self.ensure_soft_keyboard, 0.12)
         elif mode == "scroll":
             self._start_fling()
         touch.ungrab(self)
@@ -1300,7 +1391,7 @@ class PythonIDE(App):
     def build(self):
         self.title = "Python IDE"
         Window.clearcolor = C_BG
-        Window.softinput_mode = ""  # we lift the layout above the keyboard ourselves
+        Window.softinput_mode = ""  # use stable, measured manual IME insets
 
         # Default app-private workspace is always available, even before a
         # project folder is selected. An imported project gets its own private
@@ -1362,7 +1453,7 @@ class PythonIDE(App):
         self.fd_capture = None
         self.kb_height = 0
         self._full_height = Window.height
-        self._ime_works = False
+        self._keyboard_visible = False
         self._android_file_picker_bound = False
         self._android_file_picker_request = 4107
 
@@ -1542,7 +1633,9 @@ class PythonIDE(App):
             sizable_from="top",
             size_hint_y=None,
             height=dp(224),
-            min_size=dp(96),
+            # Keep enough room for the terminal header and a useful output
+            # viewport even after the user drags the splitter smaller.
+            min_size=dp(140),
             max_size=dp(560),
             strip_size=dp(14),
             keep_within_parent=True,
@@ -1730,38 +1823,53 @@ class PythonIDE(App):
         self.refresh_console_visibility()
 
     def refresh_console_visibility(self):
-        # While the keyboard is up for the editor, give it all the room.
-        typing = self.editor.focus and self.kb_height > 0
+        # Hide the output panel only while the editor owns a visible IME.
+        # input() keeps the terminal visible so its input field remains usable.
+        typing = self.editor.focus and self.kb_height > dp(80)
         self.set_console_visible(not typing)
 
     def measure_keyboard(self):
-        self._full_height = max(self._full_height, Window.height)
-        shrunk = self._full_height - Window.height  # if Android resized the window
+        """Return (visible, inset_height, manual_padding_height).
+
+        The project deliberately uses Kivy's manual soft-input mode. Use real
+        IME/window measurements instead of guessing from TextInput focus: a
+        focused editor does not prove that Android actually opened the keyboard.
+        """
+        if not self._keyboard_visible and not (
+                getattr(self, "editor", None) is not None and self.editor.focus
+                or getattr(self, "input_field", None) is not None and self.input_field.focus):
+            self._full_height = max(self._full_height, Window.height)
+
+        shrunk = max(0, int(self._full_height - Window.height))
         raw = read_ime_height()
-        height = Window.keyboard_height or 0
-        if raw is not None:
-            height = max(height, raw)
-            if raw > 0:
-                self._ime_works = True
-        if not height and not self._ime_works:
-            # Couldn't measure: assume a typical keyboard while a field has focus.
-            if self.editor.focus or self.input_field.focus:
-                height = int(Window.height * 0.36)
-        return max(0, int(height - shrunk))
+        reported = max(int(Window.keyboard_height or 0), int(raw or 0), shrunk)
+        threshold = int(dp(100))
+        visible = reported >= threshold
+
+        if not visible:
+            return False, 0, 0
+
+        # When Android has already resized the window, don't apply the same
+        # inset a second time. Otherwise lift the app exactly once per show/hide
+        # transition; do not chase the keyboard's animated intermediate heights.
+        padding = 0 if shrunk >= threshold else reported
+        return True, reported, padding
 
     def poll_keyboard(self, dt):
-        height = self.measure_keyboard()
-        if abs(height - self.kb_height) > 2:
-            self.kb_height = height
-            # Lift the whole layout so nothing sits behind the keyboard.
-            self.root_layout.padding = [0, 0, 0, height]
+        visible, height, padding = self.measure_keyboard()
+        if visible != self._keyboard_visible:
+            self._keyboard_visible = visible
+            self.kb_height = height if visible else 0
+            self.root_layout.padding = [0, 0, 0, padding if visible else 0]
             self.refresh_console_visibility()
 
     def set_console_visible(self, visible):
         parent = self.console.parent
         if visible and parent is None:
-            # Reinsert above status + custom keys, keeping the symbol bar at bottom.
-            self.root_layout.add_widget(self.console, index=2)
+            # BoxLayout stores children in reverse visual order. Insert at
+            # index=1 so the console returns BELOW the editor (and ABOVE the
+            # symbol bar), matching the original root layout order.
+            self.root_layout.add_widget(self.console, index=1)
         elif not visible and parent is not None:
             parent.remove_widget(self.console)
 
@@ -3722,12 +3830,16 @@ class PythonIDE(App):
         if not match:
             return
 
-        # Use normal backspace/insert operations so TextInput's undo stack,
-        # syntax highlighting and change bindings remain in sync.
-        for _ in match.group(0):
-            editor.do_backspace()
+        # Select and replace the identifier in one TextInput edit. Deleting
+        # characters in a loop emits repeated cursor/text events; each one can
+        # trigger horizontal auto-scroll and rebuild the suggestion strip,
+        # which makes the editor appear to jump while a completion is tapped.
+        was_focused = bool(editor.focus)
+        editor.select_text(match.start(), match.end())
         editor.insert_text(completion)
-        editor.focus = True
+        if not was_focused:
+            editor.focus = True
+        Clock.schedule_once(editor.ensure_soft_keyboard, 0.12)
 
     # ------------------------------------------------------------------
     # Running and stopping code
