@@ -41,7 +41,6 @@ from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, get_color_from_hex, platform
 from pygments.lexers import PythonLexer
 from pygments.styles import get_style_by_name
-from android_storage import AndroidStorageBridge, StorageBridgeError
 
 # ----------------------------------------------------------------------
 # Settings
@@ -176,6 +175,159 @@ def read_ime_height():
 # ----------------------------------------------------------------------
 # File helpers
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Shared-storage access
+# ----------------------------------------------------------------------
+APP_FOLDER_NAME = "Elyx"
+STORAGE_SETTINGS = "storage.json"
+
+
+def shared_storage_root():
+    """Root of the phone's main storage (normally /storage/emulated/0)."""
+    if platform == "android":
+        try:
+            from jnius import autoclass
+            Environment = autoclass("android.os.Environment")
+            return str(Environment.getExternalStorageDirectory().getAbsolutePath())
+        except Exception:
+            pass
+        return "/storage/emulated/0"
+    return os.path.expanduser("~")
+
+
+def storage_access_granted():
+    """True when Elyx may read and write ordinary files in shared storage."""
+    if platform != "android":
+        return True
+    try:
+        from jnius import autoclass
+        if autoclass("android.os.Build$VERSION").SDK_INT >= 30:
+            return bool(
+                autoclass("android.os.Environment").isExternalStorageManager())
+        from android.permissions import check_permission, Permission
+        return bool(check_permission(Permission.READ_EXTERNAL_STORAGE)
+                    and check_permission(Permission.WRITE_EXTERNAL_STORAGE))
+    except Exception:
+        return False
+
+
+def request_android_storage_access():
+    """Ask for storage access (a Settings screen on Android 11 and newer)."""
+    if platform != "android":
+        return
+    from jnius import autoclass
+    if autoclass("android.os.Build$VERSION").SDK_INT >= 30:
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        Intent = autoclass("android.content.Intent")
+        Settings = autoclass("android.provider.Settings")
+        Uri = autoclass("android.net.Uri")
+        try:
+            intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            intent.setData(Uri.parse("package:" + activity.getPackageName()))
+            activity.startActivity(intent)
+        except Exception:
+            activity.startActivity(
+                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+    else:
+        from android.permissions import request_permissions, Permission
+        request_permissions([Permission.READ_EXTERNAL_STORAGE,
+                             Permission.WRITE_EXTERNAL_STORAGE])
+
+
+def folder_is_writable(path):
+    """Really write a file: some Android versions grant the permission but
+    still refuse writes to shared storage, and that must not break Elyx."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".elyx_write_test")
+        with open(probe, "w") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def load_storage_settings(directory):
+    try:
+        with open(os.path.join(directory, STORAGE_SETTINGS), "r",
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_storage_settings(directory, data):
+    try:
+        with open(os.path.join(directory, STORAGE_SETTINGS), "w",
+                  encoding="utf-8") as handle:
+            json.dump(data, handle)
+    except OSError:
+        pass
+
+
+def friendly_path(path):
+    """Show shared-storage paths the way people think of them."""
+    root = shared_storage_root()
+    if path == root:
+        return "Internal storage"
+    if path.startswith(root + os.sep):
+        return "Internal storage" + path[len(root):]
+    return path
+
+
+def list_subfolders(path):
+    """Visible sub-folders of `path`, sorted; symlinks and hidden ones skipped."""
+    names = []
+    try:
+        with os.scandir(path) as iterator:
+            for entry in iterator:
+                if (not entry.name.startswith(".")
+                        and entry.is_dir(follow_symlinks=False)):
+                    names.append(entry.name)
+    except OSError:
+        return []
+    return sorted(names, key=str.lower)
+
+
+def move_tree(source, target):
+    """Move files from `source` into `target` without overwriting anything.
+
+    Returns (moved, skipped). A file only leaves `source` after the copy has
+    been verified, so nothing is lost if a copy fails part-way.
+    """
+    moved = skipped = 0
+    for folder, dirs, files in os.walk(source):
+        dirs[:] = [name for name in dirs if name != "__pycache__"]
+        relative = os.path.relpath(folder, source)
+        destination = target if relative == "." else os.path.join(target, relative)
+        os.makedirs(destination, exist_ok=True)
+        for name in files:
+            origin = os.path.join(folder, name)
+            copy = os.path.join(destination, name)
+            if os.path.exists(copy):
+                skipped += 1
+                continue
+            try:
+                shutil.copy2(origin, copy)
+                if os.path.getsize(copy) == os.path.getsize(origin):
+                    os.remove(origin)
+                    moved += 1
+                else:
+                    os.remove(copy)
+                    skipped += 1
+            except OSError:
+                skipped += 1
+    for folder, _dirs, _files in os.walk(source, topdown=False):
+        if folder != source:
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+    return moved, skipped
+
+
 def clean_filename(name):
     """Validate a user-typed file name and make sure it ends with .py."""
     name = name.strip()
@@ -1579,43 +1731,25 @@ class PythonIDE(App):
         Window.clearcolor = C_BG
         Window.softinput_mode = ""  # use stable, measured manual IME insets
 
-        # Default app-private workspace is always available, even before a
-        # project folder is selected. An imported project gets its own private
-        # mirror and becomes the active editor/runtime workspace.
+        # The workspace is a real folder. With storage access that is the Elyx
+        # folder in the phone's main storage (or a folder the user picked);
+        # without it, the app-private folder, which always works.
         self.default_workspace = os.path.join(self.user_data_dir, "workspace")
         os.makedirs(self.default_workspace, exist_ok=True)
+        self.storage_settings = load_storage_settings(self.user_data_dir)
+        self.shared_workspace = os.path.join(
+            shared_storage_root(), APP_FOLDER_NAME)
+        self.has_storage_access = storage_access_granted()
         self.workspace = self.default_workspace
-        self.active_project_root = None
+        if platform == "android" and self.has_storage_access:
+            chosen = self.storage_settings.get("workspace") or self.shared_workspace
+            if folder_is_writable(chosen):
+                self.workspace = chosen
         self._explorer_current_dir = self.workspace
 
-        # Android Storage Access Framework: Stage 1/2 grants persistent access;
-        # Stage 3 imports the selected tree into a private mirror. If that mirror
-        # already exists, resume using it after an app restart.
-        self.storage_bridge = AndroidStorageBridge(
-            self.user_data_dir,
-            platform_name=platform,
-            on_folder_selected=self.on_project_folder_selected,
-            on_error=self.on_project_folder_error,
-        )
-        self.project_folder = self.storage_bridge.get_saved_folder()
-        if self.project_folder:
-            try:
-                cached_project = self.storage_bridge.project_cache_path(
-                    record=self.project_folder
-                )
-                if os.path.isdir(cached_project):
-                    self.active_project_root = cached_project
-                    self.workspace = cached_project
-            except Exception:
-                pass
-
-        self._explorer_current_dir = self.workspace
-
-        # Keep the default workspace importable for the built-in file workflow.
-        if self.default_workspace not in sys.path:
-            sys.path.insert(0, self.default_workspace)
-        self._project_import_thread = None
-        self._project_sync_thread = None
+        # Keep the workspace importable for programs that import their own files.
+        if self.workspace not in sys.path:
+            sys.path.insert(0, self.workspace)
 
         self.input_queue = queue.Queue()
         self.worker = None            # thread of the currently running program
@@ -1650,8 +1784,6 @@ class PythonIDE(App):
         self.last_query = ""
         self._search_busy = False
         self._keyboard_visible = False
-        self._android_file_picker_bound = False
-        self._android_file_picker_request = 4107
 
         # Route print()/stderr from the running program to the console.
         self._orig_stdout = sys.stdout
@@ -1693,6 +1825,7 @@ class PythonIDE(App):
         self.update_tab()
         self.update_cursor()
         Clock.schedule_once(self.update_suggestions, 0)
+        Clock.schedule_once(self.check_storage_prompt, 1.5)
         return root
 
     def build_app_bar(self):
@@ -1840,7 +1973,7 @@ class PythonIDE(App):
             sizable_from="top",
             size_hint_y=None,
             height=dp(224),
-            # Keep enough room for the terminal header and a useful output
+            # Keep enough room for the console header and a useful output
             # viewport even after the user drags the splitter smaller.
             min_size=dp(140),
             max_size=dp(560),
@@ -1850,20 +1983,20 @@ class PythonIDE(App):
         content = BoxLayout(orientation="vertical", spacing=0)
         paint(content, C_PANEL)
 
-        # Compact terminal header: clear title hierarchy and a separate
+        # Compact console header: clear title hierarchy and a separate
         # icon-only clear action. The existing clear_output handler is kept.
         header = BoxLayout(
             size_hint_y=None, height=dp(42),
             padding=[dp(12), dp(2), dp(6), dp(2)], spacing=dp(9),
         )
         paint(header, C_BAR)
-        terminal_mark = make_label("›_", size=17, color=C_ACCENT,
+        console_mark = make_label("›_", size=17, color=C_ACCENT,
                                    bold=True, size_hint_x=None, width=dp(25))
-        header.add_widget(terminal_mark)
+        header.add_widget(console_mark)
 
         title_stack = BoxLayout(orientation="vertical", spacing=0)
         title_stack.add_widget(make_label(
-            "TERMINAL", size=11, color=C_TEXT, bold=True,
+            "CONSOLE", size=11, color=C_TEXT, bold=True,
         ))
         title_stack.add_widget(make_label(
             "Program output", size=9, color=C_MUTED,
@@ -1963,22 +2096,12 @@ class PythonIDE(App):
 
     def on_resume(self):
         Clock.schedule_once(self.refresh_display, 0.2)
+        Clock.schedule_once(self.recheck_storage_access, 0.5)
 
     def on_stop(self):
         self.close_game_screen()
         self.save_session()
         self.stop_capture()
-        if getattr(self, "storage_bridge", None) is not None:
-            self.storage_bridge.unbind()
-        if getattr(self, "_android_file_picker_bound", False):
-            try:
-                from jnius import autoclass
-                autoclass("org.kivy.android.PythonActivity").mActivity.unbind(
-                    on_activity_result=self._on_android_file_result
-                )
-            except Exception:
-                pass
-            self._android_file_picker_bound = False
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
         raise_in_thread(self.worker, StopRun)
@@ -2044,7 +2167,7 @@ class PythonIDE(App):
 
     def refresh_console_visibility(self):
         # Hide the output panel only while the editor owns a visible IME.
-        # input() keeps the terminal visible so its input field remains usable.
+        # input() keeps the console visible so its input field remains usable.
         typing = ((self.editor.focus or self._search_focused())
                   and self.kb_height > dp(80))
         self.set_console_visible(not typing)
@@ -2547,7 +2670,8 @@ class PythonIDE(App):
         action_icons = {
             "OK": "check", "Cancel": "x", "Save": "save",
             "Overwrite": "save", "Delete": "trash", "Continue": "arrow-right",
-            "Sync saved files": "sync", "Save all & sync": "sync",
+            "Not now": "x", "Allow": "check", "Keep private": "x",
+            "Use Elyx folder": "folder",
         }
         for label, callback, kind in actions:
             button = IconButton(
@@ -2630,169 +2754,87 @@ class PythonIDE(App):
             self.activate_document(target)
         self.save_file(then=partial(self._save_all_documents_then, then))
 
-    def choose_project_folder(self):
-        """Launch the Android system picker for a persistent project folder."""
-        if platform != "android":
-            self.show_message(
-                "Android storage",
-                "Choose Project Folder is available when this IDE runs on Android."
-            )
+    # ------------------------------------------------------------------
+    # Storage: the workspace folder and storage access
+    # ------------------------------------------------------------------
+    def check_storage_prompt(self, dt=None):
+        """First launch only: explain storage access and offer to turn it on."""
+        if platform != "android" or self.has_storage_access:
             return
-        if self.worker is not None:
-            self.show_message(
-                "Program is running",
-                "Stop the running program before changing the project folder."
-            )
+        if self.storage_settings.get("asked"):
             return
-        if (self._project_import_thread is not None
-                and self._project_import_thread.is_alive()):
-            self.show_message(
-                "Project import running",
-                "Wait for the current project import to finish before choosing another folder."
-            )
-            return
-        if (self._project_sync_thread is not None
-                and self._project_sync_thread.is_alive()):
-            self.show_message(
-                "Project sync running",
-                "Wait for synchronization to finish before changing the selected folder."
-            )
-            return
-        try:
-            self.storage_bridge.select_project_folder()
-            self.flash("Choose a project folder in the Android picker")
-        except StorageBridgeError as exc:
-            self.show_message("Could not select project folder", str(exc))
-
-    def on_project_folder_selected(self, folder):
-        """Receive a folder selection after Android has persisted its grant."""
-        def apply_selection(_dt):
-            self.project_folder = dict(folder)
-            self.flash("Project folder selected: %s" % folder.get("name", "Folder"))
-        Clock.schedule_once(apply_selection, 0)
-
-    def on_project_folder_error(self, message):
-        Clock.schedule_once(
-            lambda _dt: self.show_message("Project folder access", message), 0
+        self.storage_settings["asked"] = True
+        save_storage_settings(self.user_data_dir, self.storage_settings)
+        self.show_dialog(
+            "Allow storage access",
+            "Elyx can work directly on files in your phone's storage (in "
+            "an Elyx folder), so other apps can see them too.\n\n"
+            "Without it, your files stay private inside the app.",
+            [("Not now", None, "neutral"),
+             ("Allow", self.request_storage_access, "primary")],
+            height=dp(290),
         )
 
-    def import_project_folder(self):
-        """Import the selected SAF tree into the IDE's private project mirror."""
-        if platform != "android":
-            self.show_message(
-                "Android storage",
-                "Project import is available when the IDE runs on Android."
-            )
-            return
-        if self.worker is not None:
-            self.show_message(
-                "Program is running",
-                "Stop the running program before importing a project."
-            )
-            return
-        if (self._project_import_thread is not None
-                and self._project_import_thread.is_alive()):
-            self.flash("A project import is already running.")
-            return
-        if (self._project_sync_thread is not None
-                and self._project_sync_thread.is_alive()):
-            self.flash("Wait for project synchronization to finish.")
-            return
-
-        folder = self.storage_bridge.get_saved_folder()
-        if not folder:
-            self.show_message("No project folder", "Choose a project folder first.")
-            return
-        if not self.storage_bridge.has_persisted_permission(folder):
-            self.show_message(
-                "Project access expired",
-                "Choose the project folder again to restore Android storage access."
-            )
-            return
-
-        self.guard_unsaved(partial(self._confirm_project_import, folder))
-
-    def _confirm_project_import(self, folder):
+    def request_storage_access(self):
         try:
-            target = self.storage_bridge.project_cache_path(record=folder)
+            request_android_storage_access()
         except Exception as exc:
-            self.show_message("Project import", str(exc))
-            return
+            self.show_message(
+                "Storage access",
+                "Could not open the permission screen: %s" % exc)
 
-        if os.path.isdir(target) and os.listdir(target):
+    def recheck_storage_access(self, dt=None):
+        """After returning from Android's permission screen."""
+        granted = storage_access_granted()
+        if granted == self.has_storage_access:
+            return
+        self.has_storage_access = granted
+        if not granted:
+            if self.workspace != self.default_workspace:
+                self.flash("Storage access is off - saving may fail.")
+            return
+        if self.workspace == self.default_workspace:
             self.show_dialog(
-                "Replace local project copy?",
-                "Importing again replaces the private copy with the selected "
-                "storage folder. Local edits not yet synchronized back may be lost.",
-                [
-                    ("Cancel", None, "neutral"),
-                    ("Re-import", lambda: self._start_project_import(folder, target), "danger"),
-                ],
-                height=dp(240),
+                "Use the Elyx folder?",
+                "Storage access is on. Use %s as your workspace? Files "
+                "already in Elyx will be moved there."
+                % friendly_path(self.shared_workspace),
+                [("Keep private", None, "neutral"),
+                 ("Use Elyx folder", self.adopt_shared_workspace, "primary")],
+                height=dp(300),
             )
-        else:
-            self._start_project_import(folder, target)
 
-    def _start_project_import(self, folder, target):
-        self.set_state("Importing project...")
-        self.file_button.disabled = True
-        self.run_button.disabled = True
-        self.editor.disabled = True
+    def adopt_shared_workspace(self):
+        self.guard_unsaved(self._adopt_shared_workspace_now)
 
-        def report_progress(files, byte_count):
-            # Avoid flooding Kivy's event queue on projects with many small files.
-            if files == 1 or files % 10 == 0:
-                Clock.schedule_once(
-                    partial(self._update_project_import_progress, files, byte_count), 0
-                )
-
-        def worker_main():
-            try:
-                stats = self.storage_bridge.import_project(
-                    destination=target,
-                    record=folder,
-                    progress_callback=report_progress,
-                )
-                Clock.schedule_once(
-                    partial(self._finish_project_import, folder, target, stats, None), 0
-                )
-            except Exception as exc:
-                Clock.schedule_once(
-                    partial(self._finish_project_import, folder, target, None, str(exc)), 0
-                )
-
-        self._project_import_thread = threading.Thread(
-            target=worker_main, name="NovaProjectImport", daemon=True
-        )
-        self._project_import_thread.start()
-
-    def _update_project_import_progress(self, files, byte_count, dt):
-        size_mb = byte_count / (1024.0 * 1024.0)
-        self.set_state("Importing project... %d files · %.1f MB" % (files, size_mb))
-
-    def _finish_project_import(self, folder, target, stats, error, dt):
-        self._project_import_thread = None
-        self.file_button.disabled = False
-        self.run_button.disabled = False
-        self.editor.disabled = False
-        if error:
-            self.set_state("Ready")
-            self.show_message("Project import failed", error)
+    def _adopt_shared_workspace_now(self):
+        target = self.shared_workspace
+        if not folder_is_writable(target):
+            self.show_message(
+                "Storage access",
+                "Elyx can't write to %s on this phone, so your files stay "
+                "private." % friendly_path(target))
             return
+        moved, skipped = move_tree(self.default_workspace, target)
+        self.switch_workspace(target)
+        note = "Moved %d file%s to %s." % (
+            moved, "" if moved == 1 else "s", friendly_path(target))
+        if skipped:
+            note += " %d already existed there and were left alone." % skipped
+        self.show_message("Elyx folder ready", note)
 
-        # Remove stale modules from the previous project before switching roots.
-        self.purge_workspace_modules()
-
-        # Switch the editor/file browser to the imported private project copy.
-        self.project_folder = dict(folder)
-        self.active_project_root = target
-        self.workspace = target
-        self._explorer_current_dir = target
+    def switch_workspace(self, path, remember=True):
+        """Make `path` the folder Elyx edits, runs and browses."""
+        self.purge_workspace_modules()  # uses the old workspace path: do first
+        if self.workspace in sys.path:
+            sys.path.remove(self.workspace)
+        self.workspace = path
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        self._explorer_current_dir = path
         self._reset_documents("", create=False)
 
-        # Open a conventional root entry point when present; otherwise leave a
-        # clean buffer so the user can choose any file from the File menu.
-        entrypoint = os.path.join(target, "main.py")
+        entrypoint = os.path.join(path, "main.py")
         if not os.path.isfile(entrypoint):
             files = self.list_files()
             entrypoint = files[0][1] if files else None
@@ -2801,232 +2843,164 @@ class PythonIDE(App):
         else:
             self._reset_documents("", create=True)
 
-        self.set_state("Project ready")
-        self.flash(
-            "Imported %d files (%0.1f MB)" %
-            (stats.get("files", 0), stats.get("bytes", 0) / (1024.0 * 1024.0))
-        )
-
-    def sync_project_folder(self, delete_missing=False):
-        """Synchronize the active private project copy back to Android storage."""
-        if platform != "android":
-            self.show_message(
-                "Android storage",
-                "Project synchronization is available when the IDE runs on Android."
-            )
-            return
-        if self.worker is not None:
-            self.show_message(
-                "Program is running",
-                "Stop the running program before synchronizing the project."
-            )
-            return
-        if (self._project_import_thread is not None
-                and self._project_import_thread.is_alive()):
-            self.flash("Wait for the project import to finish.")
-            return
-        if (self._project_sync_thread is not None
-                and self._project_sync_thread.is_alive()):
-            self.flash("Project synchronization is already running.")
-            return
-
-        folder = self.storage_bridge.get_saved_folder()
-        if not folder:
-            self.show_message("No project folder", "Choose a project folder first.")
-            return
-        if not self.active_project_root or not os.path.isdir(self.active_project_root):
-            self.show_message(
-                "No active project",
-                "Import the selected project before synchronizing it."
-            )
-            return
-        try:
-            expected_root = self.storage_bridge.project_cache_path(record=folder)
-            if os.path.abspath(self.active_project_root) != os.path.abspath(expected_root):
-                self.show_message(
-                    "Different project selected",
-                    "The selected Android folder does not match the active local project. "
-                    "Import the selected folder before syncing."
-                )
-                return
-        except Exception as exc:
-            self.show_message("Project synchronization", str(exc))
-            return
-        if not self.storage_bridge.has_persisted_permission(folder):
-            self.show_message(
-                "Project access expired",
-                "Choose the project folder again to restore Android storage access."
-            )
-            return
-
-        if self.has_unsaved_documents():
-            if delete_missing:
-                message = (
-                    "One or more open files have unsaved changes. Save them before syncing and "
-                    "deleting removed files?"
-                )
+        if remember:
+            if path == self.default_workspace:
+                self.storage_settings.pop("workspace", None)
             else:
-                message = (
-                    "One or more open files have unsaved changes. Save them before syncing? "
-                    "You can also sync the files already saved in the project copy."
-                )
-            actions = [
-                ("Cancel", None, "neutral"),
-                ("Sync saved files", lambda: self._start_project_sync(
-                    folder, self.active_project_root, delete_missing), "neutral"),
-                ("Save all & sync", lambda: self._save_all_documents_then(partial(
-                    self._start_project_sync, folder, self.active_project_root,
-                    delete_missing)), "primary"),
-            ]
-            self.show_dialog("Unsaved changes", message, actions, height=dp(250))
+                self.storage_settings["workspace"] = path
+            save_storage_settings(self.user_data_dir, self.storage_settings)
+        self.save_session()
+        self.flash("Folder: %s" % friendly_path(path))
+
+    def choose_workspace_folder(self):
+        """Pick the folder Elyx works in, using Elyx's own folder browser."""
+        if self.worker is not None:
+            self.flash("Stop the running program before changing folders.")
             return
-
-        self._start_project_sync(folder, self.active_project_root, delete_missing)
-
-    def confirm_project_sync_with_deletions(self):
-        """Ask before deleting source items that no longer exist in the local copy."""
-        self.show_dialog(
-            "Sync and delete removed items?",
-            "This also permanently deletes files and folders in the selected Android "
-            "folder when they are missing from the local project copy. Files added "
-            "outside Nova IDE since the last import may also be removed. This cannot "
-            "be undone.",
-            [
-                ("Cancel", None, "neutral"),
-                ("Continue", lambda: self.sync_project_folder(delete_missing=True), "danger"),
-            ],
-            height=dp(270),
-        )
-
-    def _start_project_sync(self, folder, source_root, delete_missing=False):
-        """Run SAF synchronization off the Kivy UI thread."""
-        if (self._project_sync_thread is not None
-                and self._project_sync_thread.is_alive()):
-            self.flash("Project synchronization is already running.")
+        if platform == "android" and not self.has_storage_access:
+            self.show_dialog(
+                "Storage access needed",
+                "Allow storage access to browse and use folders on your phone.",
+                [("Not now", None, "neutral"),
+                 ("Allow", self.request_storage_access, "primary")],
+                height=dp(240),
+            )
             return
-        self.set_state("Preparing project sync...")
-        self.file_button.disabled = True
-        self.run_button.disabled = True
-        self.editor.disabled = True
+        self.guard_unsaved(lambda: self.show_folder_picker(self.workspace))
 
-        def report_progress(processed, total, relative_path, action, byte_count):
-            if processed == 1 or processed % 5 == 0 or processed == total:
-                Clock.schedule_once(partial(
-                    self._update_project_sync_progress, processed, total,
-                    relative_path, action, byte_count), 0
-                )
+    def show_folder_picker(self, directory=None):
+        root = os.path.realpath(shared_storage_root())
+        current = os.path.realpath(directory or self.workspace)
+        if not is_path_inside(root, current):
+            current = root
+        content = BoxLayout(orientation="vertical", padding=dp(10),
+                            spacing=dp(6))
+        content.add_widget(make_label(
+            friendly_path(current), size=12, color=C_MUTED, valign="top",
+            size_hint_y=None, height=dp(34)))
 
-        def worker_main():
-            try:
-                stats = self.storage_bridge.sync_project(
-                    source_root=source_root,
-                    record=folder,
-                    delete_missing=delete_missing,
-                    progress_callback=report_progress,
-                )
-                Clock.schedule_once(
-                    partial(self._finish_project_sync, stats, None), 0
-                )
-            except Exception as exc:
-                Clock.schedule_once(
-                    partial(self._finish_project_sync, None, str(exc)), 0
-                )
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4))
+        box = BoxLayout(orientation="vertical", size_hint_y=None,
+                        spacing=dp(4))
+        box.bind(minimum_height=box.setter("height"))
 
-        self._project_sync_thread = threading.Thread(
-            target=worker_main, name="NovaProjectSync", daemon=True
-        )
-        self._project_sync_thread.start()
+        def add_row(icon, text, target):
+            button = IconButton(
+                icon, text=text, bg=C_BTN, size_hint_y=None, height=dp(46),
+                halign="left", padding=[dp(42), 0])
+            button.bind(size=lambda w, sz: setattr(
+                w, "text_size", (sz[0] - dp(48), sz[1])))
+            button.bind(on_release=lambda *a: self.show_folder_picker(target))
+            box.add_widget(button)
 
-    def _update_project_sync_progress(self, processed, total, relative_path,
-                                      action, byte_count, dt):
-        size_mb = byte_count / (1024.0 * 1024.0)
-        self.set_state(
-            "Syncing %d/%d · %s · %.1f MB" %
-            (processed, total, os.path.basename(relative_path), size_mb)
-        )
+        if current != root:
+            add_row("arrow-up", ".. (up one level)", os.path.dirname(current))
+        names = list_subfolders(current)
+        for name in names:
+            add_row("folder", name, os.path.join(current, name))
+        if not names:
+            box.add_widget(make_label(
+                "No folders here.", size=13, color=C_MUTED, halign="center",
+                size_hint_y=None, height=dp(40)))
+        scroll.add_widget(box)
+        content.add_widget(scroll)
 
-    def _finish_project_sync(self, stats, error, dt):
-        self._project_sync_thread = None
-        self.file_button.disabled = False
-        self.run_button.disabled = False
-        self.editor.disabled = False
-        if error:
-            self.set_state("Sync incomplete")
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        cancel = IconButton("x", text="Cancel", bg=C_BAR)
+        new_folder = IconButton("folder-plus", text="New", bg=C_BTN)
+        use = IconButton("check", text="Use this", bg=C_PRIMARY)
+        for button in (cancel, new_folder, use):
+            row.add_widget(button)
+        content.add_widget(row)
+
+        popup = self.open_popup("Choose folder", content,
+                                size_hint=(0.94, 0.8))
+        cancel.bind(on_release=lambda *a: popup.dismiss())
+        new_folder.bind(
+            on_release=lambda *a: self.show_new_folder_dialog(current))
+        use.bind(on_release=lambda *a: self._use_folder(popup, current))
+        popup.open()
+
+    def _use_folder(self, popup, path):
+        popup.dismiss()
+        if not folder_is_writable(path):
             self.show_message(
-                "Project synchronization failed",
-                error + "\n\nSome earlier files may already have synchronized. "
-                "Run sync again after resolving the problem."
-            )
+                "Can't use this folder",
+                "Elyx can't write to %s. Pick another folder."
+                % friendly_path(path))
             return
+        Clock.schedule_once(lambda dt: self.switch_workspace(path), 0)
 
-        self.set_state("Project synchronized")
-        summary = (
-            "Created: %d\nUpdated: %d\nUnchanged: %d\n" 
-            "Folders created: %d\nDeleted files: %d\nDeleted folders: %d\n" 
-            "Bytes written: %.1f KB"
-        ) % (
-            stats.get("created", 0), stats.get("updated", 0),
-            stats.get("unchanged", 0), stats.get("folders_created", 0),
-            stats.get("deleted_files", 0), stats.get("deleted_folders", 0),
-            stats.get("bytes", 0) / 1024.0,
-        )
-        if stats.get("preserved_remote_only"):
-            summary += (
-                "\n\n%d source-only file(s) were preserved. "
-                "Use the delete-removed-items option only when you intend to remove them."
-                % stats["preserved_remote_only"]
-            )
-        self.show_message("Project synchronized", summary)
+    def show_new_folder_dialog(self, parent):
+        content = BoxLayout(orientation="vertical", padding=dp(14),
+                            spacing=dp(8))
+        field = TextInput(hint_text="Folder name", multiline=False,
+                          font_size=sp(15), size_hint_y=None, height=dp(44),
+                          write_tab=False)
+        self.style_input(field)
+        error = make_label("", size=12, color=C_STOP, size_hint_y=None,
+                           height=dp(20))
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        cancel = IconButton("x", text="Cancel")
+        create = IconButton("folder-plus", text="Create", bg=C_PRIMARY)
+        row.add_widget(cancel)
+        row.add_widget(create)
+        for widget in (field, error, row):
+            content.add_widget(widget)
+        popup = self.open_popup("New folder", content, height=dp(250),
+                                pos_hint={"center_x": 0.5, "top": 0.93})
+
+        def make(*args):
+            name = field.text.strip()
+            if (not name or name in (".", "..") or "/" in name
+                    or "\\" in name):
+                error.text = "Use a simple folder name."
+                return
+            path = os.path.join(parent, name)
+            try:
+                os.makedirs(path, exist_ok=False)
+            except OSError as exc:
+                error.text = "Could not create it: %s" % (exc.strerror or exc)
+                return
+            popup.dismiss()
+            Clock.schedule_once(lambda dt: self.show_folder_picker(path), 0)
+
+        def back(*args):
+            popup.dismiss()
+            Clock.schedule_once(lambda dt: self.show_folder_picker(parent), 0)
+
+        cancel.bind(on_release=back)
+        create.bind(on_release=make)
+        field.bind(on_text_validate=make)
+        popup.bind(on_open=lambda *a: Clock.schedule_once(
+            lambda dt: setattr(field, "focus", True), 0.1))
+        popup.open()
 
     def show_file_menu(self, instance=None):
-        """Show file and project-folder actions without shrinking the editor."""
+        """File actions without shrinking the editor."""
         self.editor.focus = False
         content = BoxLayout(orientation="vertical", padding=dp(12),
                             spacing=dp(7))
-
         popup = self.open_popup(
-            "File", content, size_hint=(0.90, None), height=dp(650)
+            "File", content, size_hint=(0.90, None), height=dp(600)
         )
+        content.add_widget(make_label(
+            text="Folder: %s" % friendly_path(self.workspace), size=11,
+            color=C_MUTED, valign="top", size_hint_y=None, height=dp(38),
+        ))
 
-        folder = self.storage_bridge.get_saved_folder()
-        if folder:
-            has_access = self.storage_bridge.has_persisted_permission(folder)
-            if platform == "android":
-                access_text = "persistent access granted" if has_access else "access needs renewal"
-            else:
-                access_text = "available in Android app"
-            try:
-                selected_cache = self.storage_bridge.project_cache_path(record=folder)
-                is_active = (self.active_project_root is not None
-                             and os.path.abspath(self.active_project_root)
-                             == os.path.abspath(selected_cache))
-            except Exception:
-                is_active = False
-            active_text = ("\nlocal project copy active"
-                           if is_active else "\nnot imported yet")
-            folder_text = "Project folder: %s\n%s%s" % (
-                folder.get("name", "Selected"), access_text, active_text
-            )
-        else:
-            folder_text = "Project folder: not selected"
-        folder_status = make_label(
-            text=folder_text, size=11, color=C_MUTED,
-            size_hint_y=None, height=dp(38),
-        )
-        content.add_widget(folder_status)
-
-        actions = (
+        actions = [
             ("Project explorer", "folder-open", self.open_project_explorer),
             ("New file", "file-plus", self.new_file),
             ("Open file", "folder", self.show_open_dialog),
             ("Edit actions", "pencil", self.show_edit_menu),
             ("Save", "save", self.save_file),
             ("Save as", "file-plus", self.show_save_as),
-            ("Choose project folder", "folder", self.choose_project_folder),
-            ("Import selected project", "import", self.import_project_folder),
-            ("Sync project to selected folder", "sync", self.sync_project_folder),
-            ("Sync + delete removed items", "sync", self.confirm_project_sync_with_deletions),
-        )
+            ("Change folder", "folder", self.choose_workspace_folder),
+        ]
+        if platform == "android" and not self.has_storage_access:
+            actions.append(
+                ("Allow storage access", "check", self.request_storage_access))
         for label, icon, callback in actions:
             button = IconButton(
                 icon, text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
@@ -3551,15 +3525,9 @@ class PythonIDE(App):
     # Project explorer (Stage 6)
     # ------------------------------------------------------------------
     def open_project_explorer(self, instance=None):
-        """Open a navigable view of the active private project workspace."""
+        """Open a navigable view of the current workspace folder."""
         if self.worker is not None:
             self.flash("Stop the running program before managing project files.")
-            return
-        if ((self._project_import_thread is not None
-             and self._project_import_thread.is_alive())
-                or (self._project_sync_thread is not None
-                    and self._project_sync_thread.is_alive())):
-            self.flash("Wait for project import or synchronization to finish.")
             return
         self.show_project_explorer(self._explorer_current_dir or self.workspace)
 
@@ -3570,7 +3538,7 @@ class PythonIDE(App):
         path = os.path.realpath(os.path.abspath(path))
         root = self._explorer_root()
         if not is_path_inside(root, path, allow_root=allow_root):
-            raise ValueError("That item is outside the active project folder.")
+            raise ValueError("That item is outside the current folder.")
         return path
 
     def show_project_explorer(self, directory=None):
@@ -3741,9 +3709,7 @@ class PythonIDE(App):
             font_size=sp(11), padding=[dp(38), 0],
         )
         content.add_widget(close)
-        title = "Project Explorer"
-        if self.active_project_root:
-            title += " · " + os.path.basename(root)
+        title = "Project Explorer · " + (os.path.basename(root) or "storage")
         popup = self.open_popup(title, content, size_hint=(0.97, 0.88))
         close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
@@ -4050,126 +4016,6 @@ class PythonIDE(App):
         self.flash("Deleted %s" % os.path.basename(path))
         self.show_project_explorer(self._explorer_current_dir)
 
-    def _open_internal_storage_from_dialog(self, instance=None):
-        self.close_popup()
-        Clock.schedule_once(
-            lambda _dt: self.open_from_internal_storage(), 0.15
-        )
-
-    def open_from_internal_storage(self, instance=None):
-        """Import one file from Android's system document picker into the workspace."""
-        if platform != "android":
-            self.show_message(
-                "Internal storage",
-                "Open from internal storage is available in the Android app."
-            )
-            return
-        if self.worker is not None:
-            self.show_message(
-                "Program is running",
-                "Stop the running program before opening another file."
-            )
-            return
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            Intent = autoclass("android.content.Intent")
-            activity = PythonActivity.mActivity
-            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-            intent.addCategory(Intent.CATEGORY_OPENABLE)
-            intent.setType("*/*")
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            # Keep the listener bound until Android returns the selected URI.
-            if not self._android_file_picker_bound:
-                activity.bind(on_activity_result=self._on_android_file_result)
-                self._android_file_picker_bound = True
-            activity.startActivityForResult(
-                intent, self._android_file_picker_request
-            )
-            self.flash("Choose a file from internal storage")
-        except Exception as exc:
-            self.show_message("Could not open storage picker", str(exc))
-
-    def _on_android_file_result(self, request_code, result_code, intent):
-        """Read the selected SAF URI and copy it into the active IDE workspace."""
-        if request_code != self._android_file_picker_request:
-            return
-        if result_code != -1 or intent is None:  # Activity.RESULT_OK
-            self.flash("File selection cancelled")
-            return
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            OpenableColumns = autoclass(
-                "android.provider.OpenableColumns"
-            )
-            activity = PythonActivity.mActivity
-            uri = intent.getData()
-            if uri is None:
-                raise ValueError("Android did not return a file location.")
-
-            name = None
-            cursor = activity.getContentResolver().query(
-                uri, None, None, None, None
-            )
-            if cursor is not None:
-                try:
-                    if cursor.moveToFirst():
-                        column = cursor.getColumnIndex(
-                            OpenableColumns.DISPLAY_NAME
-                        )
-                        if column >= 0:
-                            name = str(cursor.getString(column))
-                finally:
-                    cursor.close()
-            if not name:
-                name = str(uri.getLastPathSegment() or "imported_file")
-                name = name.rsplit(":", 1)[-1]
-            name = os.path.basename(name.replace("\\", "/")).strip()
-            if not name or name in (".", ".."):
-                name = "imported_file"
-
-            descriptor = activity.getContentResolver().openFileDescriptor(
-                uri, "r"
-            )
-            if descriptor is None:
-                raise OSError("Android could not read the selected file.")
-            try:
-                source_fd = os.dup(descriptor.getFd())
-                with os.fdopen(source_fd, "rb") as source:
-                    data = source.read(MAX_FILE_BYTES + 1)
-            finally:
-                descriptor.close()
-            if len(data) > MAX_FILE_BYTES:
-                raise ValueError(
-                    "This file is larger than the IDE's 1 MB open-file limit."
-                )
-            try:
-                text = data.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                raise ValueError(
-                    "This file is not valid UTF-8 text and cannot be opened in the code editor."
-                )
-
-            os.makedirs(self.workspace, exist_ok=True)
-            target = os.path.join(self.workspace, name)
-            if os.path.exists(target):
-                stem, extension = os.path.splitext(name)
-                index = 1
-                while os.path.exists(target):
-                    target = os.path.join(
-                        self.workspace, "%s_imported_%d%s" % (
-                            stem, index, extension
-                        )
-                    )
-                    index += 1
-            with open(target, "w", encoding="utf-8", newline="\n") as output:
-                output.write(text)
-            self.open_file(target)
-            self.flash("Imported %s" % os.path.basename(target))
-        except Exception as exc:
-            self.show_message("Could not open selected file", str(exc))
-
     def show_open_dialog(self):
         self.editor.focus = False
         files = self.list_files()
@@ -4178,13 +4024,6 @@ class PythonIDE(App):
         content.add_widget(make_label(
             f"Workspace: {self.workspace}", size=11, color=C_MUTED, valign="top",
             size_hint_y=None, height=dp(34)))
-
-        internal_button = IconButton(
-            "folder", text="Open from internal storage",
-            bg=C_PRIMARY, size_hint_y=None, height=dp(48),
-        )
-        internal_button.bind(on_release=self._open_internal_storage_from_dialog)
-        content.add_widget(internal_button)
 
         if not files:
             content.add_widget(make_label(
@@ -4491,14 +4330,6 @@ class PythonIDE(App):
     def run_code(self, instance):
         if self.worker is not None:
             self.flash("A program is already running.")
-            return
-        if (self._project_import_thread is not None
-                and self._project_import_thread.is_alive()):
-            self.flash("Wait for the project import to finish.")
-            return
-        if (self._project_sync_thread is not None
-                and self._project_sync_thread.is_alive()):
-            self.flash("Wait for project synchronization to finish.")
             return
 
         code = self.editor.text

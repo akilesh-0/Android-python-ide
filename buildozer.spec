@@ -1,11 +1,7 @@
 
 [app]
 
-title = Elyx
-
-# ELYX branding assets
-icon.filename = %(source.dir)s/elyx_android_brand_assets/elyx_icon.png
-presplash.filename = %(source.dir)s/elyx_android_brand_assets/elyx_splash.png
+title = Android Python IDE
 package.name = androidpythonide
 package.domain = org.akilesh
 
@@ -35,9 +31,10 @@ android.ndk_api = 24
 android.archs = armeabi-v7a
 
 # Application permissions
-# Device files are opened/saved with Android's Storage Access Framework
-# (system document picker), so broad shared-storage permissions are not needed.
-android.permissions = INTERNET
+# Elyx works directly on files in shared storage (the Elyx folder).
+# Android 11+ uses MANAGE_EXTERNAL_STORAGE ("All files access", switched on in
+# Settings); Android 10 and older use the READ/WRITE_EXTERNAL_STORAGE pair.
+android.permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE
 
 # Build configuration
 android.accept_sdk_license = True
