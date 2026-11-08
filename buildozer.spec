@@ -1,8 +1,8 @@
 
 [app]
 
-title = Android Python IDE
-package.name = androidpythonide
+title = Elyx IDE
+package.name = ELYX-IDE
 package.domain = org.akilesh
 
 source.dir = .
