@@ -11,9 +11,17 @@ source.exclude_dirs = .git,.github,.buildozer,bin,venv,.venv,__pycache__
 
 version = 0.1.0
 
+# App icon and splash screen (files in the elyx_android_brand_assets folder).
+# The splash colour fills the screen around the splash image; set it to match
+# the splash image's background if you see a visible edge.
+icon.filename = %(source.dir)s/elyx_android_brand_assets/elyx_icon.png
+presplash.filename = %(source.dir)s/elyx_android_brand_assets/elyx_splash.png
+android.presplash_color = #282a36
+
 # Core Kivy app dependencies.
+# pyjnius and android are used for the storage permission screens.
 # Pygame requires a compatible Android build recipe.
-requirements = python3,kivy,pygments
+requirements = python3,kivy,pygments,pyjnius,android
 
 orientation = portrait
 fullscreen = 0

@@ -4,6 +4,7 @@ import bisect
 import builtins
 import contextlib
 import ctypes
+import importlib.util
 import json
 import keyword
 import linecache
@@ -326,6 +327,51 @@ def move_tree(source, target):
             except OSError:
                 pass
     return moved, skipped
+
+
+def import_turtle_engine():
+    """Import the turtle engine wherever its files ended up.
+
+    Normally it is a ``turtle_engine/`` folder next to main.py. If the files
+    were copied loose next to main.py, or into a folder with another name,
+    that still works: any folder holding the engine's __init__.py and
+    turtle_*.py files is loaded as the ``turtle_engine`` package.
+    """
+    existing = sys.modules.get("turtle_engine")
+    if existing is not None:
+        return existing
+    try:
+        import turtle_engine
+        return turtle_engine
+    except ImportError:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [here]
+    try:
+        candidates += [
+            os.path.join(here, name) for name in sorted(os.listdir(here))
+            if os.path.isdir(os.path.join(here, name))
+        ]
+    except OSError:
+        pass
+    for folder in candidates:
+        if all(os.path.isfile(os.path.join(folder, name)) for name in
+               ("__init__.py", "turtle_core.py", "turtle_api.py",
+                "turtle_commands.py", "turtle_renderer.py", "turtle_preview.py")):
+            spec = importlib.util.spec_from_file_location(
+                "turtle_engine", os.path.join(folder, "__init__.py"),
+                submodule_search_locations=[folder])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["turtle_engine"] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop("turtle_engine", None)
+                raise
+            return module
+    raise ModuleNotFoundError(
+        "turtle engine files not found next to main.py (looked in %s)" % here)
 
 
 def clean_filename(name):
@@ -4384,6 +4430,7 @@ class PythonIDE(App):
         turtle or the engine could not start (the reason goes to the console).
         """
         try:
+            import_turtle_engine()
             from turtle_engine import TurtleCommandBridge, TurtleRuntime
             from turtle_engine.turtle_preview import (
                 TurtlePreviewScreen, code_uses_turtle)
@@ -4425,8 +4472,9 @@ class PythonIDE(App):
         except Exception as exc:
             self.append_output(
                 "[turtle] could not start: %s: %s\n"
-                "Make sure the turtle_engine/ folder (with __init__.py) is "
-                "next to main.py.\n\n" % (type(exc).__name__, exc))
+                "The turtle files (__init__.py and turtle_*.py, six in all) "
+                "must be in the app, in a turtle_engine/ folder next to "
+                "main.py.\n\n" % (type(exc).__name__, exc))
             return None
 
     def show_turtle(self):
@@ -4580,6 +4628,7 @@ class PythonIDE(App):
 
             compiled = compile(code, name, "exec")
             if turtle_runtime is not None:
+                import_turtle_engine()
                 from turtle_engine import turtle_module_context
                 turtle_scope = turtle_module_context(turtle_runtime)
             else:
