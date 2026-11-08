@@ -1,6 +1,8 @@
 """Python IDE for Android, built with Kivy."""
 
+import bisect
 import builtins
+import contextlib
 import ctypes
 import json
 import keyword
@@ -28,6 +30,7 @@ from kivy.resources import resource_find
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.codeinput import CodeInput
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
@@ -459,6 +462,17 @@ class IconButton(FlatButton):
                 stroke([cx, bottom, cx, top])
                 stroke([cx - size * 0.68, cy + size * 0.30,
                         cx, top, cx + size * 0.68, cy + size * 0.30])
+            elif icon in ("arrow-down", "down"):
+                stroke([cx, bottom, cx, top])
+                stroke([cx - size * 0.68, cy - size * 0.30,
+                        cx, bottom, cx + size * 0.68, cy - size * 0.30])
+            elif icon == "search":
+                lens_r = size * 0.62
+                lens_x, lens_y = cx - size * 0.18, cy + size * 0.18
+                Line(circle=(lens_x, lens_y, lens_r), width=weight * 1.15)
+                stroke([lens_x + lens_r * 0.72, lens_y - lens_r * 0.72,
+                        cx + size * 0.85, cy - size * 0.85],
+                       width=weight * 1.35)
             elif icon == "refresh":
                 stroke([cx + size * 0.68, cy + size * 0.35,
                         cx + size * 0.68, top,
@@ -668,6 +682,38 @@ class FdCapture:
         self.read_fd = None
 
 
+class TurtleOverlay(FloatLayout):
+    """Opaque full-screen host for the turtle preview.
+
+    It paints its own background and swallows every touch so nothing leaks
+    through to the editor underneath.
+    """
+
+    def __init__(self, content, **kwargs):
+        super().__init__(**kwargs)
+        with self.canvas.before:
+            Color(0.09, 0.10, 0.14, 1)
+            self._bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+        self.add_widget(content)
+
+    def _sync_bg(self, *_args):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+
+    def on_touch_down(self, touch):
+        super().on_touch_down(touch)
+        return True
+
+    def on_touch_move(self, touch):
+        super().on_touch_move(touch)
+        return True
+
+    def on_touch_up(self, touch):
+        super().on_touch_up(touch)
+        return True
+
+
 HOLD_SECONDS = 0.5  # press-and-hold selects a word on touch screens
 
 
@@ -844,6 +890,39 @@ class SmartCodeInput(CodeInput):
         if moved:
             self._redraw_text()
         return moved
+
+    def reveal(self, row, col, length=0):
+        """Scroll so text at (row, col) is comfortably on screen.
+
+        Used by find / go to line. Nothing moves if the spot is already
+        well inside the view.
+        """
+        dy = self.line_height + self.line_spacing
+        if dy <= 0 or self.height <= 0:
+            return
+        lines = self.text.split("\n")
+        row = max(0, min(row, len(lines) - 1))
+        line = lines[row]
+        col = max(0, min(col, len(line)))
+        tab_width = max(1, int(getattr(self, "tab_width", 4) or 4))
+        visual_start = len(line[:col].expandtabs(tab_width))
+        visual_end = len(line[:col + max(0, length)].expandtabs(tab_width))
+        pad_left, pad_top = self.padding[0], self.padding[1]
+
+        # Vertical: distance from the widget's top edge to the row's top.
+        rel_y = pad_top + row * dy - self.scroll_y
+        margin_y = dy * 1.5
+        if rel_y < margin_y or rel_y + dy > self.height - margin_y:
+            target = pad_top + row * dy - (self.height / 2 - dy / 2)
+            self.scroll_y = min(max(target, 0), self._max_scroll_y())
+
+        # Horizontal: keep the match inside the visible width.
+        start_x = pad_left + visual_start * self.ide_char_w - self.scroll_x
+        end_x = pad_left + visual_end * self.ide_char_w - self.scroll_x
+        if start_x < dp(12) or end_x > self.width - dp(24):
+            target_x = pad_left + visual_start * self.ide_char_w - self.width * 0.25
+            self.scroll_x = min(max(target_x, 0), self._max_scroll_x())
+        self._redraw_text()
 
     def _redraw_text(self):
         # TextInput doesn't redraw its text when scroll_x/scroll_y are set from
@@ -1142,6 +1221,113 @@ class BracketMatcher:
                 pos=(x, y + dp(1)),
                 size=(char_width, max(dp(1), dy - dp(2))),
             ))
+
+
+class SearchHighlighter:
+    """Paint find matches (and the go-to-line flash) behind the editor text."""
+
+    MATCH_COLOR = (1.0, 0.85, 0.2, 0.24)
+    CURRENT_COLOR = (1.0, 0.60, 0.15, 0.62)
+    FLASH_SECONDS = 1.2
+
+    def __init__(self, editor, backdrop):
+        self.editor = editor
+        self.group = InstructionGroup()
+        backdrop.canvas.before.add(self.group)
+        self.matches = []
+        self.current = -1
+        self.flash_row = None
+        self._flash_event = None
+        self._trigger = Clock.create_trigger(self.redraw, 0)
+        editor.bind(
+            text=self.schedule,
+            scroll_x=self.schedule,
+            scroll_y=self.schedule,
+            pos=self.schedule,
+            size=self.schedule,
+            padding=self.schedule,
+            font_size=self.schedule,
+        )
+
+    def schedule(self, *args):
+        self._trigger()
+
+    def set_matches(self, matches, current):
+        self.matches = matches
+        self.current = current
+        self.schedule()
+
+    def flash_line(self, row):
+        self.flash_row = row
+        if self._flash_event is not None:
+            self._flash_event.cancel()
+        self._flash_event = Clock.schedule_once(self._end_flash, self.FLASH_SECONDS)
+        self.schedule()
+
+    def _end_flash(self, dt):
+        self.flash_row = None
+        self._flash_event = None
+        self.schedule()
+
+    def redraw(self, *args):
+        ed = self.editor
+        self.group.clear()
+        if (not self.matches and self.flash_row is None) or ed.width <= 0 or ed.height <= 0:
+            return
+        dy = ed.line_height + ed.line_spacing
+        char_width = getattr(ed, "ide_char_w", 0)
+        if dy <= 0 or char_width <= 0:
+            return
+
+        lines = ed.text.split("\n")
+        starts = []
+        offset = 0
+        for line in lines:
+            starts.append(offset)
+            offset += len(line) + 1
+        tab_width = max(1, int(getattr(ed, "tab_width", 4) or 4))
+        top0 = ed.top - ed.padding[1] + ed.scroll_y
+        first_row = max(0, int((top0 - ed.top) // dy) - 1)
+        last_row = min(len(lines) - 1, int((top0 - ed.y) // dy) + 1)
+        if last_row < first_row:
+            return
+
+        if self.flash_row is not None and 0 <= self.flash_row < len(lines):
+            y = top0 - (self.flash_row + 1) * dy
+            self.group.add(Color(C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.22))
+            self.group.add(Rectangle(pos=(ed.x, y), size=(ed.width, dy)))
+
+        if not self.matches:
+            return
+        match_starts = [match[0] for match in self.matches]
+        low = bisect.bisect_left(match_starts, starts[first_row])
+        high = bisect.bisect_right(
+            match_starts, starts[last_row] + len(lines[last_row]))
+
+        def add_rect(match):
+            begin, end = match
+            row = bisect.bisect_right(starts, begin) - 1
+            if not (0 <= row < len(lines)):
+                return
+            line = lines[row]
+            col = begin - starts[row]
+            visual_start = len(line[:col].expandtabs(tab_width))
+            visual_end = len(line[:col + (end - begin)].expandtabs(tab_width))
+            x = ed.x + ed.padding[0] + visual_start * char_width - ed.scroll_x
+            width = max(char_width * 0.5, (visual_end - visual_start) * char_width)
+            y = top0 - (row + 1) * dy
+            if x + width < ed.x or x > ed.right or y + dy < ed.y or y > ed.top:
+                return
+            self.group.add(Rectangle(
+                pos=(x, y + dp(1)), size=(width, max(dp(1), dy - dp(2)))))
+
+        self.group.add(Color(*self.MATCH_COLOR))
+        for index in range(low, high):
+            if index != self.current:
+                add_rect(self.matches[index])
+        if 0 <= self.current < len(self.matches):
+            self.group.add(Color(*self.CURRENT_COLOR))
+            add_rect(self.matches[self.current])
 
 
 class IndentationGuides:
@@ -1453,6 +1639,16 @@ class PythonIDE(App):
         self.fd_capture = None
         self.kb_height = 0
         self._full_height = Window.height
+        # Find / replace / go to line
+        self.search_panel = None
+        self.search_mode = None
+        self.search_matches = []
+        self.search_index = -1
+        self.search_case = False
+        self.search_whole = False
+        self.search_anchor = 0
+        self.last_query = ""
+        self._search_busy = False
         self._keyboard_visible = False
         self._android_file_picker_bound = False
         self._android_file_picker_request = 4107
@@ -1481,6 +1677,7 @@ class PythonIDE(App):
 
         self.editor.bind(text=self.on_editor_text, cursor=self.update_cursor)
         self.editor.bind(focus=self.on_editor_focus)
+        self.editor.bind(text=self._on_search_editor_text)
         self.editor.bind(text=self.update_suggestions,
                          cursor=self.update_suggestions,
                          selection_text=self.update_suggestions)
@@ -1523,6 +1720,13 @@ class PythonIDE(App):
         )
         self.file_button.bind(on_release=self.show_file_menu)
 
+        # Search sits right beside File: find, replace and go to line.
+        self.search_button = IconButton(
+            "search", label="Search", bg=C_BTN,
+            size_hint_x=None, width=dp(42),
+        )
+        self.search_button.bind(on_release=self.show_search_menu)
+
         # Run and Stop use matching, thin outline glyphs with no overlaid text.
         self.run_button = IconButton(
             "play", label="Run code", bg=C_RUN, size_hint_x=None,
@@ -1534,6 +1738,7 @@ class PythonIDE(App):
             width=dp(48), disabled=True,
         )
         self.stop_button.bind(on_release=self.stop_code)
+        bar.add_widget(self.search_button)
         bar.add_widget(self.file_button)
         bar.add_widget(self.run_button)
         bar.add_widget(self.stop_button)
@@ -1624,6 +1829,7 @@ class PythonIDE(App):
         self.indent_guides = IndentationGuides(self.editor, area)
         self.gutter = LineNumberGutter(self.editor, area)
         self.bracket_matcher = BracketMatcher(self.editor, area)
+        self.search_highlighter = SearchHighlighter(self.editor, area)
         area.add_widget(self.gutter)
         area.add_widget(self.editor)
         return area
@@ -1781,12 +1987,19 @@ class PythonIDE(App):
                     modifier=None):
         if key != 27:  # Android back button / Esc
             return False
+        overlay = getattr(self, "turtle_overlay", None)
+        if overlay is not None and overlay.parent is not None:
+            self.close_turtle()
+            return True
         game = sys.modules.get("pygame_host")
         if game is not None and game.is_open():
             game.request_close()
             return True
         if self.popup is not None:
             self.close_popup()
+            return True
+        if self.search_panel is not None and self.search_panel.parent is not None:
+            self.close_search()
             return True
         if self.editor.focus:
             self.editor.focus = False
@@ -1808,6 +2021,12 @@ class PythonIDE(App):
             self.new_file()
         elif letter == "r":
             self.run_code(None)
+        elif letter == "f":
+            self.open_search("find")
+        elif letter == "h":
+            self.open_search("replace")
+        elif letter == "g":
+            self.open_search("goto")
         elif letter == "a":
             self.select_all_text()
         elif letter == "c":
@@ -1826,7 +2045,8 @@ class PythonIDE(App):
     def refresh_console_visibility(self):
         # Hide the output panel only while the editor owns a visible IME.
         # input() keeps the terminal visible so its input field remains usable.
-        typing = self.editor.focus and self.kb_height > dp(80)
+        typing = ((self.editor.focus or self._search_focused())
+                  and self.kb_height > dp(80))
         self.set_console_visible(not typing)
 
     def measure_keyboard(self):
@@ -1838,7 +2058,8 @@ class PythonIDE(App):
         """
         if not self._keyboard_visible and not (
                 getattr(self, "editor", None) is not None and self.editor.focus
-                or getattr(self, "input_field", None) is not None and self.input_field.focus):
+                or getattr(self, "input_field", None) is not None and self.input_field.focus
+                or self._search_focused()):
             self._full_height = max(self._full_height, Window.height)
 
         shrunk = max(0, int(self._full_height - Window.height))
@@ -2852,6 +3073,393 @@ class PythonIDE(App):
         content.add_widget(close)
         popup.open()
 
+    # ------------------------------------------------------------------
+    # Search: find, replace, go to line
+    # ------------------------------------------------------------------
+    SEARCH_LIMIT = 5000
+
+    def show_search_menu(self, instance=None):
+        self.editor.focus = False
+        content = BoxLayout(orientation="vertical", padding=dp(12),
+                            spacing=dp(7))
+        popup = self.open_popup(
+            "Search", content, size_hint=(0.82, None), height=dp(300)
+        )
+        actions = (
+            ("Find", "search", lambda: self.open_search("find")),
+            ("Find and replace", "sync", lambda: self.open_search("replace")),
+            ("Go to line", "arrow-right", lambda: self.open_search("goto")),
+        )
+        for label, icon, callback in actions:
+            button = IconButton(
+                icon, text=label, bg=C_BTN, size_hint_y=None, height=dp(48),
+                padding=[dp(42), 0],
+            )
+            button.bind(on_release=partial(self._dialog_action, popup, callback))
+            content.add_widget(button)
+
+        close = IconButton(
+            "x", label="Close", bg=C_BAR,
+            size_hint_x=None, width=dp(44), size_hint_y=None, height=dp(40),
+        )
+        close.bind(on_release=lambda *args: popup.dismiss())
+        content.add_widget(close)
+        popup.open()
+
+    def _ensure_search_panel(self):
+        if self.search_panel is not None:
+            return self.search_panel
+
+        extra = {}
+        if hasattr(TextInput, "keyboard_suggestions"):
+            extra["keyboard_suggestions"] = False
+
+        def make_field(hint, **kwargs):
+            field = TextInput(
+                multiline=False, hint_text=hint, font_size=sp(14),
+                size_hint_y=None, height=dp(40), write_tab=False,
+                unfocus_on_touch=False,       # keep the keyboard up on Next/Prev
+                text_validate_unfocus=False,  # Enter can be pressed repeatedly
+                **extra, **kwargs,
+            )
+            self.style_input(field)
+            field.padding = [dp(10), dp(10), dp(10), dp(6)]
+            return field
+
+        self.find_field = make_field("Find")
+        self.replace_field = make_field("Replace with")
+        self.goto_field = make_field("Line number", input_filter="int")
+        for field in (self.find_field, self.replace_field, self.goto_field):
+            field.bind(focus=self._on_search_focus)
+        self.find_field.bind(text=self._on_find_text,
+                             on_text_validate=lambda *a: self.find_step(1))
+        self.replace_field.bind(on_text_validate=lambda *a: self.replace_current())
+        self.goto_field.bind(on_text_validate=lambda *a: self.goto_line())
+
+        def square(icon, label, bg=C_BTN):
+            return IconButton(icon, label=label, bg=bg,
+                              size_hint=(None, 1), width=dp(40))
+
+        self.find_prev = square("arrow-up", "Previous match")
+        self.find_next = square("arrow-down", "Next match")
+        self.search_close = square("x", "Close search", bg=C_BAR)
+        self.goto_button = square("arrow-right", "Go to line", bg=C_PRIMARY)
+        self.find_prev.bind(on_release=lambda *a: self.find_step(-1))
+        self.find_next.bind(on_release=lambda *a: self.find_step(1))
+        self.search_close.bind(on_release=lambda *a: self.close_search())
+        self.goto_button.bind(on_release=lambda *a: self.goto_line())
+
+        self.case_button = FlatButton(text="Aa", size_hint=(None, 1),
+                                      width=dp(44), font_size=sp(12))
+        self.word_button = FlatButton(text="Word", size_hint=(None, 1),
+                                      width=dp(58), font_size=sp(12))
+        self.case_button.bind(on_release=lambda *a: self.toggle_search_option("case"))
+        self.word_button.bind(on_release=lambda *a: self.toggle_search_option("whole"))
+        self.find_count = make_label("", size=12, color=C_MUTED, halign="right")
+
+        self.replace_button = FlatButton(text="Replace", bg=C_PRIMARY,
+                                         size_hint=(None, 1), width=dp(78),
+                                         font_size=sp(12))
+        self.replace_all_button = FlatButton(text="All", bg=C_PRIMARY,
+                                             size_hint=(None, 1), width=dp(52),
+                                             font_size=sp(12))
+        self.replace_button.bind(on_release=lambda *a: self.replace_current())
+        self.replace_all_button.bind(on_release=lambda *a: self.replace_all())
+
+        self.search_row1 = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        self.search_row2 = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(4))
+        self.search_row3 = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+
+        panel = BoxLayout(orientation="vertical", size_hint_y=None,
+                          height=dp(82), spacing=dp(4),
+                          padding=[dp(6), dp(4), dp(6), dp(4)])
+        paint(panel, C_BAR)
+        self.search_panel = panel
+        self._style_search_toggles()
+        return panel
+
+    def _layout_search_panel(self, mode):
+        panel = self.search_panel
+        panel.clear_widgets()
+        for row in (self.search_row1, self.search_row2, self.search_row3):
+            row.clear_widgets()
+        if mode == "goto":
+            self.search_row1.add_widget(self.goto_field)
+            self.search_row1.add_widget(self.goto_button)
+            self.search_row1.add_widget(self.search_close)
+            panel.add_widget(self.search_row1)
+            panel.height = dp(48)
+            return
+        for widget in (self.find_field, self.find_prev, self.find_next,
+                       self.search_close):
+            self.search_row1.add_widget(widget)
+        for widget in (self.case_button, self.word_button, self.find_count):
+            self.search_row2.add_widget(widget)
+        panel.add_widget(self.search_row1)
+        panel.add_widget(self.search_row2)
+        panel.height = dp(82)
+        if mode == "replace":
+            for widget in (self.replace_field, self.replace_button,
+                           self.replace_all_button):
+                self.search_row3.add_widget(widget)
+            panel.add_widget(self.search_row3)
+            panel.height = dp(126)
+
+    def open_search(self, mode="find"):
+        self.close_popup()
+        panel = self._ensure_search_panel()
+        self.search_mode = mode
+        self._layout_search_panel(mode)
+        if panel.parent is None:
+            # Directly above the editor, below the file tabs.
+            area = self.editor.parent
+            self.root_layout.add_widget(
+                panel, index=self.root_layout.children.index(area) + 1)
+
+        self.search_anchor = self.editor.cursor_index()
+        if mode == "goto":
+            total = self.editor.text.count("\n") + 1
+            self.goto_field.hint_text = "Line number (1-%d)" % total
+            self.goto_field.text = ""
+            self.search_matches = []
+            self.search_index = -1
+            self.search_highlighter.set_matches([], -1)
+            target = self.goto_field
+        else:
+            selected = self.editor.selection_text
+            if selected and "\n" not in selected and len(selected) <= 100:
+                self.last_query = selected
+            self._search_busy = True
+            try:
+                self.find_field.text = self.last_query
+            finally:
+                self._search_busy = False
+            self.refresh_search()
+            target = self.find_field
+        Clock.schedule_once(partial(self._focus_search_field, target), 0.1)
+
+    def _focus_search_field(self, field, dt=None):
+        field.focus = True
+        if field.text:
+            Clock.schedule_once(lambda _dt: field.select_all(), 0.05)
+
+    def close_search(self):
+        panel = self.search_panel
+        if panel is None or panel.parent is None:
+            return
+        for field in (self.find_field, self.replace_field, self.goto_field):
+            field.focus = False
+        self.root_layout.remove_widget(panel)
+        self.search_mode = None
+        self.search_matches = []
+        self.search_index = -1
+        self.search_highlighter.set_matches([], -1)
+        self.refresh_console_visibility()
+        self.update_suggestions()
+
+    def _focused_search_field(self):
+        panel = self.search_panel
+        if panel is None or panel.parent is None:
+            return None
+        for field in (self.find_field, self.replace_field, self.goto_field):
+            if field.focus:
+                return field
+        return None
+
+    def _search_focused(self):
+        return self._focused_search_field() is not None
+
+    def _on_search_focus(self, field, focused):
+        self.refresh_console_visibility()
+        self.update_suggestions()
+
+    def _style_search_toggles(self):
+        for button, on in ((self.case_button, self.search_case),
+                           (self.word_button, self.search_whole)):
+            button.bg = C_PRIMARY if on else C_BTN
+            button._refresh()
+
+    def toggle_search_option(self, which):
+        if which == "case":
+            self.search_case = not self.search_case
+        else:
+            self.search_whole = not self.search_whole
+        self._style_search_toggles()
+        self.refresh_search(anchor=self.search_anchor)
+
+    # -- matching -----------------------------------------------------
+    def _search_pattern(self):
+        query = self.find_field.text if self.search_panel is not None else ""
+        if not query:
+            return None
+        body = re.escape(query)
+        if self.search_whole:
+            body = r"(?<!\w)" + body + r"(?!\w)"
+        return re.compile(body, 0 if self.search_case else re.IGNORECASE)
+
+    def compute_matches(self):
+        pattern = self._search_pattern()
+        if pattern is None:
+            return []
+        found = []
+        for match in pattern.finditer(self.editor.text):
+            if match.end() > match.start():
+                found.append((match.start(), match.end()))
+                if len(found) >= self.SEARCH_LIMIT:
+                    break
+        return found
+
+    def refresh_search(self, anchor=None, jump=True):
+        matches = self.compute_matches()
+        self.search_matches = matches
+        if matches:
+            where = self.search_anchor if anchor is None else anchor
+            index = bisect.bisect_left([m[0] for m in matches], where)
+            self.search_index = index if index < len(matches) else 0
+        else:
+            self.search_index = -1
+        self._sync_search_ui()
+        if jump and matches:
+            self.reveal_current_match()
+
+    def _sync_search_ui(self):
+        total = len(self.search_matches)
+        query = self.find_field.text
+        if not query:
+            self.find_count.text = ""
+            self.find_count.color = C_MUTED
+        elif total == 0:
+            self.find_count.text = "No results"
+            self.find_count.color = C_STOP
+        else:
+            plus = "+" if total >= self.SEARCH_LIMIT else ""
+            self.find_count.text = "%d of %d%s" % (self.search_index + 1, total, plus)
+            self.find_count.color = C_MUTED
+        self.search_highlighter.set_matches(self.search_matches, self.search_index)
+
+    def reveal_current_match(self):
+        if not (0 <= self.search_index < len(self.search_matches)):
+            return
+        start, end = self.search_matches[self.search_index]
+        ed = self.editor
+        col, row = ed.get_cursor_from_index(start)
+        self._search_busy = True
+        try:
+            ed.cancel_selection()
+            ed.cursor = (col, row)
+        finally:
+            self._search_busy = False
+        ed.reveal(row, col, end - start)
+        self.search_anchor = start
+
+    def _on_find_text(self, field, value):
+        if self._search_busy:
+            return
+        self.last_query = value
+        self.refresh_search()
+
+    def _on_search_editor_text(self, editor, value):
+        # The code changed (typing, tab switch, replace): keep matches current.
+        if (self._search_busy or self.search_panel is None
+                or self.search_panel.parent is None):
+            return
+        if self.search_mode == "goto":
+            total = value.count("\n") + 1
+            self.goto_field.hint_text = "Line number (1-%d)" % total
+            return
+        self.refresh_search(anchor=editor.cursor_index(), jump=False)
+
+    def find_step(self, direction):
+        if self.search_mode not in ("find", "replace"):
+            return
+        if not self.search_matches:
+            self.refresh_search()
+            if not self.search_matches:
+                if self.find_field.text:
+                    self.flash("No matches")
+                return
+            return
+        self.search_index = (self.search_index + direction) % len(self.search_matches)
+        self._sync_search_ui()
+        self.reveal_current_match()
+
+    # -- replace ------------------------------------------------------
+    def _replace_range(self, start, end, replacement):
+        """Replace text[start:end] as one editor edit (undo and dirty flag work).
+
+        Goes straight to TextInput.insert_text so the editor's smart bracket
+        and quote pairing never rewrites what the user typed as replacement.
+        """
+        ed = self.editor
+        self._search_busy = True
+        try:
+            ed.select_text(start, end)
+            ed.delete_selection()
+            if replacement:
+                TextInput.insert_text(ed, replacement)
+            ed.cancel_selection()
+        finally:
+            self._search_busy = False
+
+    def replace_current(self):
+        if self.search_mode != "replace":
+            return
+        if not (0 <= self.search_index < len(self.search_matches)):
+            self.flash("No match to replace")
+            return
+        start, end = self.search_matches[self.search_index]
+        replacement = self.replace_field.text
+        self._replace_range(start, end, replacement)
+        self.refresh_search(anchor=start + len(replacement))
+
+    def replace_all(self):
+        if self.search_mode != "replace":
+            return
+        pattern = self._search_pattern()
+        if pattern is None:
+            self.flash("Type something to find first")
+            return
+        ed = self.editor
+        text = ed.text
+        replacement = self.replace_field.text
+        new_text, count = pattern.subn(lambda match: replacement, text)
+        if count == 0:
+            self.flash("No matches")
+            return
+        old_index = ed.cursor_index()
+        scroll_x, scroll_y = ed.scroll_x, ed.scroll_y
+        self._replace_range(0, len(text), new_text)
+        ed.cursor = ed.get_cursor_from_index(min(old_index, len(new_text)))
+        ed.scroll_x, ed.scroll_y = scroll_x, scroll_y
+        ed._redraw_text()
+        self.refresh_search(anchor=old_index, jump=False)
+        self.flash("Replaced %d occurrence%s" % (count, "" if count == 1 else "s"))
+
+    # -- go to line ---------------------------------------------------
+    def goto_line(self):
+        if self.search_mode != "goto":
+            return
+        ed = self.editor
+        lines = ed.text.split("\n")
+        total = len(lines)
+        raw = self.goto_field.text.strip()
+        try:
+            wanted = int(raw)
+        except ValueError:
+            self.flash("Enter a line number (1-%d)" % total)
+            return
+        line = max(1, min(wanted, total))
+        text = lines[line - 1]
+        col = len(text) - len(text.lstrip())  # first non-blank character
+        self.close_search()
+        ed.cancel_selection()
+        ed.cursor = (col, line - 1)
+        ed.reveal(line - 1, col, 0)
+        self.search_highlighter.flash_line(line - 1)
+        Clock.schedule_once(lambda dt: setattr(ed, "focus", True), 0.05)
+        if line != wanted:
+            self.flash("Line %d is out of range - went to line %d" % (wanted, line))
+
     def select_all_text(self):
         # Kivy can clear selection during a focus update; schedule after the
         # popup closes so the selection remains visible.
@@ -3768,6 +4376,14 @@ class PythonIDE(App):
         self._bar_current = box
 
     def insert_symbol(self, symbol, instance):
+        field = self._focused_search_field()
+        if field is not None:
+            # Typing into the find/replace box: keep the symbols out of the code.
+            if symbol == "PASTE":
+                field.paste()
+            elif symbol != "TAB":
+                field.insert_text(symbol)
+            return
         editor = self.editor
         if symbol == "TAB":
             editor.insert_text(INDENT)
@@ -3783,6 +4399,12 @@ class PythonIDE(App):
     def update_suggestions(self, *args):
         if getattr(self, "_completing", False):
             return  # apply_completion refreshes the strip once when done
+        if self._search_focused():
+            # Suggestions belong to the editor; show plain symbols while the
+            # find / replace box has the keyboard.
+            self._last_options = ()
+            self.show_bar(self.symbol_box)
+            return
         if self.editor.selection_text:
             # Suggestions describe the word before the cursor and make no
             # sense while text is selected; show the symbol bar instead.
@@ -3889,6 +4511,8 @@ class PythonIDE(App):
         self.purge_workspace_modules()
         if "pygame" in code:
             self.setup_pygame()
+        self._turtle_error = False
+        self.turtle_runtime = self.setup_turtle(code)
 
         # Remove stale answers / stop signals from an earlier run.
         while True:
@@ -3913,11 +4537,146 @@ class PythonIDE(App):
 
         thread = threading.Thread(
             target=self.execute_code,
-            args=(code, name, file_path, run_root),
+            args=(code, name, file_path, run_root, self.turtle_runtime),
             daemon=True,
         )
         self.worker = thread
         thread.start()
+
+    # ------------------------------------------------------------------
+    # Turtle graphics
+    # ------------------------------------------------------------------
+    def setup_turtle(self, code):
+        """Prepare the turtle preview when the program uses ``import turtle``.
+
+        Returns the run's TurtleRuntime, or None if the program doesn't use
+        turtle or the engine could not start (the reason goes to the console).
+        """
+        try:
+            from turtle_engine import TurtleCommandBridge, TurtleRuntime
+            from turtle_engine.turtle_preview import (
+                TurtlePreviewScreen, code_uses_turtle)
+            if not code_uses_turtle(code):
+                return None
+
+            old = getattr(self, "turtle_runtime", None)
+            if old is not None:
+                old.close()
+
+            bridge = getattr(self, "turtle_bridge", None)
+            if bridge is None:
+                bridge = self.turtle_bridge = TurtleCommandBridge()
+            session_id = bridge.start_session()
+            runtime = TurtleRuntime(bridge, session_id)
+
+            screen = getattr(self, "turtle_screen", None)
+            if screen is None:
+                screen = TurtlePreviewScreen(
+                    bridge, session_id,
+                    on_back=self.close_turtle,
+                    on_run=lambda: self.run_code(None),
+                    on_stop=lambda: self.stop_code(None),
+                    on_reset=self.reset_turtle,
+                )
+                self.turtle_screen = screen
+                self.turtle_overlay = TurtleOverlay(screen)
+            else:
+                screen.set_session(session_id, clear=True)
+
+            renderer = screen.renderer
+            renderer.set_event_dispatcher(
+                runtime.dispatch_click, runtime.dispatch_key)
+            renderer.set_keyboard_listening(False)
+            screen.set_running(True)
+            screen.set_status("running")
+            self.show_turtle()
+            return runtime
+        except Exception as exc:
+            self.append_output(
+                "[turtle] could not start: %s: %s\n"
+                "Make sure the turtle_engine/ folder (with __init__.py) is "
+                "next to main.py.\n\n" % (type(exc).__name__, exc))
+            return None
+
+    def show_turtle(self):
+        overlay = getattr(self, "turtle_overlay", None)
+        if overlay is None or overlay.parent is not None:
+            return
+        Window.add_widget(overlay)
+        try:
+            self.turtle_screen.on_pre_enter()
+        except Exception:
+            pass
+
+    def close_turtle(self, *_args):
+        """Hide the turtle screen (stopping the program if it is running)."""
+        if self.worker is not None:
+            self.stop_code(None)
+        overlay = getattr(self, "turtle_overlay", None)
+        if overlay is None or overlay.parent is None:
+            return
+        try:
+            self.turtle_screen.on_pre_leave()
+        except Exception:
+            pass
+        Window.remove_widget(overlay)
+        Clock.schedule_once(self.refresh_display, 0.1)
+
+    def reset_turtle(self):
+        if self.worker is not None:
+            self.flash("Stop the program before resetting.")
+            return
+        renderer = self.turtle_screen.renderer
+        renderer.cancel_pending()
+        renderer.clear_canvas()
+
+    def turtle_ui_done(self):
+        """Update the turtle screen once the program has finished."""
+        if getattr(self, "turtle_runtime", None) is None:
+            return
+        self.turtle_runtime = None
+        screen = self.turtle_screen
+        screen.set_running(False)
+        if self._turtle_error:
+            screen.set_status("error")
+            self.close_turtle()
+            self.flash("Turtle program error - see the console.")
+        else:
+            screen.set_status("done")
+
+    def _set_turtle_keyboard(self, enabled, dt=None):
+        screen = getattr(self, "turtle_screen", None)
+        if screen is not None:
+            screen.renderer.set_keyboard_listening(enabled)
+
+    def wait_for_turtle(self, runtime):
+        """Like turtle.mainloop(): stay alive while click/key/timer callbacks
+        are registered, until the program is stopped."""
+        listening = False
+        while (runtime is not None and runtime.has_interactions
+               and not self.stop_requested):
+            wants = runtime.wants_keyboard
+            if wants != listening:
+                listening = wants
+                Clock.schedule_once(partial(self._set_turtle_keyboard, wants), 0)
+            time.sleep(0.1)
+
+    def finish_turtle_session(self, runtime):
+        try:
+            runtime.close()
+        except Exception:
+            pass
+        bridge = getattr(self, "turtle_bridge", None)
+        if bridge is None:
+            return
+        try:
+            if self.stop_requested:
+                bridge.cancel_session(runtime.session_id)  # drop queued drawing
+            else:
+                bridge.finish_session(runtime.session_id)  # let it finish drawing
+        except Exception:
+            pass
+        Clock.schedule_once(partial(self._set_turtle_keyboard, False), 0)
 
     def setup_pygame(self):
         """Plug in the pygame-compatible layer (pygame/ + pygame_host.py)."""
@@ -3967,7 +4726,8 @@ class PythonIDE(App):
         run_builtins["input"] = self.request_input
         return run_builtins
 
-    def execute_code(self, code, name, file_path, run_root=None):
+    def execute_code(self, code, name, file_path, run_root=None,
+                     turtle_runtime=None):
         me = threading.current_thread()
         started = time.perf_counter()
         previous_cwd = os.getcwd()
@@ -3988,20 +4748,29 @@ class PythonIDE(App):
             linecache.cache[name] = (len(code), None, code.splitlines(True), name)
 
             compiled = compile(code, name, "exec")
-            exec(compiled, {
-                "__name__": "__main__",
-                "__file__": file_path,
-                "__builtins__": self.make_builtins(),
-            })
+            if turtle_runtime is not None:
+                from turtle_engine import turtle_module_context
+                turtle_scope = turtle_module_context(turtle_runtime)
+            else:
+                turtle_scope = contextlib.nullcontext()
+            with turtle_scope:
+                exec(compiled, {
+                    "__name__": "__main__",
+                    "__file__": file_path,
+                    "__builtins__": self.make_builtins(),
+                })
+                self.wait_for_turtle(turtle_runtime)
         except StopRun:
             self.append_output("\n[Stopped]\n")
         except SystemExit:
             pass
         except SyntaxError as exc:
+            self._turtle_error = True
             self.append_output(
                 "\n" + "".join(traceback.format_exception_only(type(exc), exc))
             )
         except BaseException as exc:
+            self._turtle_error = True
             # Skip this method's own frame so only the user's code is shown.
             tb = exc.__traceback__.tb_next if exc.__traceback__ else None
             self.append_output(
@@ -4015,6 +4784,8 @@ class PythonIDE(App):
             except OSError:
                 pass
             sys.path[:] = previous_sys_path
+            if turtle_runtime is not None:
+                self.finish_turtle_session(turtle_runtime)
             try:
                 elapsed = time.perf_counter() - started
                 self.append_output(f"\nFinished in {elapsed:.3f} seconds.\n")
@@ -4049,6 +4820,7 @@ class PythonIDE(App):
             game.end_run()
 
     def reset_ui(self):
+        self.turtle_ui_done()
         self.close_game_screen()
         self.stop_capture()
         Clock.schedule_once(self.refresh_display, 0.1)
