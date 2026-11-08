@@ -37,6 +37,31 @@ class ElyxTurtle:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._core, name)
 
+    def pencolor(self, *color: Any) -> Any:
+        if color:
+            color_to_rgba(color[0] if len(color) == 1 else tuple(color))
+        return self._core.pencolor(*color)
+
+    def fillcolor(self, *color: Any) -> Any:
+        if color:
+            color_to_rgba(color[0] if len(color) == 1 else tuple(color))
+        return self._core.fillcolor(*color)
+
+    def color(self, *colors: Any) -> Any:
+        # Check in the program's own thread so a bad color is an ordinary
+        # exception with a traceback instead of a failure inside the renderer.
+        if len(colors) == 3:
+            color_to_rgba(tuple(colors))
+        else:
+            for value in colors[:2]:
+                color_to_rgba(value)
+        return self._core.color(*colors)
+
+    def dot(self, size: Optional[float] = None, color: Any = None) -> Any:
+        if color is not None:
+            color_to_rgba(color)
+        return self._core.dot(size, color)
+
     def getscreen(self) -> "ElyxScreen":
         return self._runtime.screen
 

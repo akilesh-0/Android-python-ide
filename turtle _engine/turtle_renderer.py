@@ -12,7 +12,9 @@ TurtleRenderer raises a clear RuntimeError.
 from collections import deque
 from dataclasses import dataclass
 import math
+import re
 import threading
+import traceback
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .turtle_commands import TurtleCommand, TurtleCommandBridge
@@ -64,6 +66,36 @@ _NAMED_COLORS: Dict[str, str] = {
     "lime": "#00ff00", "gold": "#ffd700", "violet": "#ee82ee",
     "turquoise": "#40e0d0", "teal": "#008080", "coral": "#ff7f50",
     "indigo": "#4b0082", "maroon": "#800000", "olive": "#808000",
+    "silver": "#c0c0c0", "skyblue": "#87ceeb", "lightblue": "#add8e6",
+    "darkgreen": "#006400", "darkblue": "#00008b", "lightgreen": "#90ee90",
+    "crimson": "#dc143c", "salmon": "#fa8072", "tomato": "#ff6347",
+    "tan": "#d2b48c", "beige": "#f5f5dc", "khaki": "#f0e68c",
+    "orchid": "#da70d6", "plum": "#dda0dd", "chocolate": "#d2691e",
+    "darkred": "#8b0000", "hotpink": "#ff69b4", "forestgreen": "#228b22",
+    "seagreen": "#2e8b57", "steelblue": "#4682b4", "royalblue": "#4169e1",
+    "midnightblue": "#191970", "firebrick": "#b22222", "lavender": "#e6e6fa",
+    "ivory": "#fffff0", "darkorange": "#ff8c00", "orangered": "#ff4500",
+    "deeppink": "#ff1493", "lightyellow": "#ffffe0", "lightpink": "#ffb6c1",
+    "darkviolet": "#9400d3", "blueviolet": "#8a2be2", "slateblue": "#6a5acd",
+    "dodgerblue": "#1e90ff", "deepskyblue": "#00bfff",
+    "cornflowerblue": "#6495ed", "lightseagreen": "#20b2aa",
+    "mediumseagreen": "#3cb371", "springgreen": "#00ff7f",
+    "limegreen": "#32cd32", "yellowgreen": "#9acd32", "chartreuse": "#7fff00",
+    "greenyellow": "#adff2f", "darkcyan": "#008b8b", "lightcyan": "#e0ffff",
+    "aquamarine": "#7fffd4", "sienna": "#a0522d", "saddlebrown": "#8b4513",
+    "peru": "#cd853f", "wheat": "#f5deb3", "goldenrod": "#daa520",
+    "darkgoldenrod": "#b8860b", "rosybrown": "#bc8f8f",
+    "lightcoral": "#f08080", "indianred": "#cd5c5c",
+    "darkmagenta": "#8b008b", "mediumpurple": "#9370db",
+    "thistle": "#d8bfd8", "linen": "#faf0e6", "snow": "#fffafa",
+    "mintcream": "#f5fffa", "aliceblue": "#f0f8ff",
+    "whitesmoke": "#f5f5f5", "gainsboro": "#dcdcdc", "dimgray": "#696969",
+    "dimgrey": "#696969", "darkslategray": "#2f4f4f",
+    "slategray": "#708090", "lightsteelblue": "#b0c4de",
+    "powderblue": "#b0e0e6", "cadetblue": "#5f9ea0",
+    "darkturquoise": "#00ced1", "mediumturquoise": "#48d1cc",
+    "paleturquoise": "#afeeee", "lightsalmon": "#ffa07a",
+    "darkolivegreen": "#556b2f", "lightgoldenrod": "#eedd82",
 }
 
 
@@ -75,7 +107,11 @@ def color_to_rgba(value: Any) -> RGBA:
     normalized 0..1 values or byte-style 0..255 values.
     """
     if isinstance(value, str):
-        text = value.strip().lower()
+        text = value.strip().lower().replace(" ", "")
+        shade = re.fullmatch(r"gr[ae]y(\d{1,3})", text)  # Tk's gray0..gray100
+        if shade and int(shade.group(1)) <= 100:
+            level = round(int(shade.group(1)) * 255 / 100)
+            text = "#%02x%02x%02x" % (level, level, level)
         text = _NAMED_COLORS.get(text, text)
         if not text.startswith("#"):
             raise ValueError("unsupported color name: %s" % value)
@@ -568,6 +604,16 @@ class TurtleRenderer(_Widget):
         self._background_rect.size = self.size
 
     def _on_tick(self, dt: float) -> bool:
+        try:
+            return self._on_tick_inner(dt)
+        except Exception:
+            # An exception escaping a Kivy Clock callback closes the whole
+            # app. Drop the offending command, log it, and keep drawing.
+            traceback.print_exc()
+            self._active = None
+            return not self._disposed
+
+    def _on_tick_inner(self, dt: float) -> bool:
         if self._disposed:
             self._clock_event = None
             return False
