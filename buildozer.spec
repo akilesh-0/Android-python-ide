@@ -2,7 +2,7 @@
 [app]
 
 title = Elyx IDE
-package.name = ELYX-IDE
+package.name = androidpythonide 
 package.domain = org.akilesh
 
 source.dir = .
